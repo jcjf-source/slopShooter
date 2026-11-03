@@ -130,6 +130,11 @@ canvas{display:block;position:absolute;inset:0;width:100%;height:100%;cursor:cro
 const TAU = Math.PI * 2;
 const VIEW_H = 900;          // logical world height
 const CELL = 64;             // spatial-grid cell size for collision queries
+const GATE_OPEN_SECONDS = 3.5; // seconds of full squad fire needed to shoot a gate open
+const MAX_ARMY = 100000;      // absolute soldier cap
+const MAX_GUNS = 50;          // bullet streams; beyond this, bullets get wider/stronger instead of more numerous
+const ARMY_SCALING = 0.6;     // firepower above MAX_GUNS soldiers grows as (n/50)^0.6 (keeps huge armies from trivialising waves)
+const SOLDIER_HP = 30;
 const rand = (a, b) => a + Math.random() * (b - a);
 const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
 const dist2 = (ax, ay, bx, by) => { const dx = ax - bx, dy = ay - by; return dx * dx + dy * dy; };
@@ -314,13 +319,14 @@ class Particles {
   burst(x, y, color, n, speed = 200, life = 0.6, size = 3, drag = 3) {
     for (let i = 0; i < n && this.list.length < this.max; i++) {
       const a = Math.random() * TAU, s = speed * (0.25 + Math.random() * 0.75);
-      this.list.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: life * (0.6 + Math.random() * 0.4), max: life, color, size: size * (0.6 + Math.random() * 0.8), drag });
+      // z / vz give particles real height: debris pops up and falls back to the ground
+      this.list.push({ x, y, z: rand(6, 18), vx: Math.cos(a) * s, vy: Math.sin(a) * s, vz: speed * rand(0.1, 0.9), life: life * (0.6 + Math.random() * 0.4), max: life, color, size: size * (0.6 + Math.random() * 0.8), drag });
     }
   }
   cone(x, y, ang, spread, color, n, speed, life, size) {
     for (let i = 0; i < n && this.list.length < this.max; i++) {
       const a = ang + rand(-spread, spread), s = speed * rand(0.4, 1);
-      this.list.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: life * rand(0.6, 1), max: life, color, size, drag: 5 });
+      this.list.push({ x, y, z: 14, vx: Math.cos(a) * s, vy: Math.sin(a) * s, vz: rand(-20, 40), life: life * rand(0.6, 1), max: life, color, size, drag: 5 });
     }
   }
   ring(x, y, color, radius, life = 0.4, width = 4) { if (this.rings.length < 60) this.rings.push({ x, y, color, radius, life, max: life, width }); }
@@ -331,18 +337,25 @@ class Particles {
       if (p.life <= 0) { L[i] = L[L.length - 1]; L.pop(); continue; }
       const d = Math.exp(-p.drag * dt); p.vx *= d; p.vy *= d;
       p.x += p.vx * dt; p.y += p.vy * dt;
+      p.z += p.vz * dt; p.vz -= 520 * dt;
+      if (p.z < 0) { p.z = 0; p.vz *= -0.35; p.vx *= 0.6; p.vy *= 0.6; }
     }
     for (let i = this.rings.length - 1; i >= 0; i--) { const r = this.rings[i]; r.life -= dt; if (r.life <= 0) this.rings.splice(i, 1); }
   }
-  draw(ctx) {
+  // Drawn in screen space through the perspective camera
+  draw(ctx, cam) {
     ctx.globalCompositeOperation = 'lighter';
     for (const p of this.list) {
+      cam.p(p.x, p.y, p.z); if (cam.Z < 40) continue;
       const a = p.life / p.max; ctx.globalAlpha = a; ctx.fillStyle = p.color;
-      const s = p.size * (0.4 + a * 0.6); ctx.fillRect(p.x - s / 2, p.y - s / 2, s, s);
+      const s = Math.max(1, p.size * (0.4 + a * 0.6) * cam.S * 0.8); ctx.fillRect(cam.X - s / 2, cam.Y - s / 2, s, s);
     }
     for (const r of this.rings) {
-      const t = 1 - r.life / r.max; ctx.globalAlpha = 1 - t; ctx.strokeStyle = r.color;
-      ctx.lineWidth = r.width * (1 - t) + 0.5; circle(ctx, r.x, r.y, r.radius * (1 - Math.pow(1 - t, 3))); ctx.stroke();
+      cam.p(r.x, r.y, 2); if (cam.Z < 40) continue;
+      const t = 1 - r.life / r.max, R = r.radius * (1 - Math.pow(1 - t, 3)) * cam.S;
+      ctx.globalAlpha = 1 - t; ctx.strokeStyle = r.color;
+      ctx.lineWidth = (r.width * (1 - t) + 0.5) * Math.min(2, cam.S);
+      ctx.beginPath(); ctx.ellipse(cam.X, cam.Y, R, R * cam.squash(cam.Z), 0, 0, TAU); ctx.stroke();
     }
     ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
   }
@@ -394,7 +407,7 @@ const CAT_COLOR = { army: '#3dff9a', stat: '#4da3ff', special: '#ff5cf0', weapon
 const GATE_TYPES = [
   { id: 's5',  cat: 'army', w: 10, label: (g, m) => `+${Math.round(5 * m)} SOLDIERS`,  apply: (g, m) => g.squad.add(Math.round(5 * m)) },
   { id: 's10', cat: 'army', w: 6,  label: (g, m) => `+${Math.round(10 * m)} SOLDIERS`, apply: (g, m) => g.squad.add(Math.round(10 * m)) },
-  { id: 'x2',  cat: 'army', w: 3,  label: () => 'x2 SOLDIERS', apply: g => g.squad.add(Math.min(g.squad.total, 400)) },
+  { id: 'x2',  cat: 'army', w: 3,  label: () => 'x2 SOLDIERS', apply: g => g.squad.add(g.squad.total) },
   { id: 'fire', cat: 'stat', w: 6, label: (g, m) => `+${Math.round(20 * m)}% FIRE RATE`, apply: (g, m) => { g.stats.fireRate *= 1 + 0.2 * m; } },
   { id: 'dmg',  cat: 'stat', w: 6, label: (g, m) => `+${Math.round(25 * m)}% DAMAGE`,    apply: (g, m) => { g.stats.damage *= 1 + 0.25 * m; } },
   { id: 'triple', cat: 'special', w: 3, label: g => g.stats.multishot > 1 ? 'TRIPLE SHOT+' : 'TRIPLE SHOT',
@@ -426,7 +439,10 @@ const ACHIEVEMENTS = [
   { id: 'k100',   name: 'Centurion',      desc: 'Defeat 100 enemies',            check: g => g.kills >= 100 },
   { id: 'k1000',  name: 'Exterminator',   desc: 'Defeat 1,000 enemies',          check: g => g.kills >= 1000 },
   { id: 'army25', name: 'Platoon',        desc: 'Command 25 soldiers',           check: g => g.squad.total >= 25 },
-  { id: 'army100',name: 'Battalion',      desc: 'Command 100 soldiers',          check: g => g.squad.total >= 100 },
+  { id: 'merge',  name: 'Strength in Numbers', desc: 'Merge 100 soldiers into a Champion', check: g => g.squad.total >= 100 },
+  { id: 'army1k', name: 'Regiment',       desc: 'Command 1,000 soldiers',        check: g => g.squad.total >= 1000 },
+  { id: 'army10k',name: 'Legion',         desc: 'Command 10,000 soldiers',       check: g => g.squad.total >= 10000 },
+  { id: 'army100k', name: 'God of War',   desc: 'Reach the 100,000 soldier limit', check: g => g.squad.total >= MAX_ARMY },
   { id: 'boss1',  name: 'Giant Slayer',   desc: 'Defeat a boss',                 check: g => g.bossKills >= 1 },
   { id: 'boss3',  name: 'Living Legend',  desc: 'Defeat 3 bosses',               check: g => g.bossKills >= 3 },
   { id: 'combo50',name: 'Combo Master',   desc: 'Reach a 50-kill combo',         check: g => g.maxCombo >= 50 },
@@ -439,35 +455,99 @@ const ACHIEVEMENTS = [
 
 /* ---------------- 6. Entities ---------------- */
 
-// A single soldier. Position eases toward its formation slot around the squad anchor.
+// Army tiers: 100 basic soldiers merge into one bigger, recoloured Champion, then every
+// 10 of a tier merge into the next. 100,000 soldiers = a single God of War.
+const TIERS = [
+  { weight: 1,      scale: 1,   color: '#2fa8ff', helmet: '#1d6aa5', name: 'SOLDIER' },
+  { weight: 100,    scale: 1.7, color: '#c35bff', helmet: '#7a2fb0', name: 'CHAMPION' },
+  { weight: 1000,   scale: 2.3, color: '#ff9d3c', helmet: '#b35c12', name: 'TITAN' },
+  { weight: 10000,  scale: 3.0, color: '#ff3b5c', helmet: '#a3162f', name: 'COLOSSUS' },
+  { weight: 100000, scale: 4.0, color: '#ffd23f', helmet: '#c79a00', name: 'GOD OF WAR' },
+];
+
+// One figure in the squad. A tier-0 figure is one soldier; higher tiers stand for `weight` soldiers.
+// Position eases toward its formation slot around the squad anchor.
 class Soldier {
-  constructor(x, y) {
+  constructor(x, y, tier = 0) {
+    const T = TIERS[tier];
     this.x = x; this.y = y; this.ox = 0; this.oy = 0;
-    this.hp = this.maxHp = 30; this.cd = Math.random() * 0.6;
+    this.tier = tier; this.weight = T.weight; this.scale = T.scale; this.rad = 7 * T.scale;
+    this.hp = this.maxHp = SOLDIER_HP; this.wound = 0;   // merged figures accumulate wounds; every SOLDIER_HP costs one soldier
     this.angle = -Math.PI / 2; this.flash = 0; this.recoil = 0; this.bob = Math.random() * TAU; this.dead = false;
   }
 }
 
-// The squad: an anchor point (moved by WASD) plus soldiers in a sunflower formation.
-// Soldiers beyond the active cap are kept as reserves: they refill losses and boost damage.
+// The squad: an anchor point (moved by WASD), a head-count, and the figures that represent it.
+// Firing is done by up to MAX_GUNS "gun streams" spread across the figures by weight.
 class Squad {
-  constructor(g) { this.g = g; this.x = g.W / 2; this.y = g.H - 130; this.soldiers = []; this.reserves = 0; this.maxActive = 40; this.radius = 20; }
-  get total() { return this.soldiers.length + this.reserves; }
-  add(n) {
-    for (let i = 0; i < n; i++) {
-      if (this.soldiers.length < this.maxActive) this.soldiers.push(new Soldier(this.x + rand(-30, 30), this.y + rand(20, 60)));
-      else this.reserves++;
-    }
-    this.layout();
+  constructor(g) {
+    this.g = g; this.x = g.W / 2; this.y = g.H - 130; this.soldiers = []; this.guns = [];
+    this.count = 0; this.lastCount = 0; this.dirty = false; this.radius = 20;
+    this.eff = 0; this.gunMult = 1; this.bulletWidth = 1;
   }
-  healAll() { for (const s of this.soldiers) s.hp = s.maxHp; }
-  // Golden-angle spiral: compact, natural-looking crowd. Index 0 is the leader.
+  get total() { return this.count; }
+  add(n) {
+    if (this.count >= MAX_ARMY) { this.g.addText(this.x, this.y - this.radius - 40, 'MAX ARMY', '#ffd23f', 20); return; }
+    this.count = Math.min(MAX_ARMY, this.count + n);
+    this.sync();
+  }
+  lose(n) { this.count = Math.max(0, this.count - n); this.dirty = true; }
+  healAll() { for (const s of this.soldiers) { s.hp = s.maxHp; s.wound = 0; } }
+  // Rebuild the figures so they match the head-count in tier form (merging or splitting as needed)
+  sync() {
+    const g = this.g, grew = this.count > this.lastCount;
+    this.dirty = false;
+    this.soldiers = this.soldiers.filter(s => !s.dead);
+    let rem = this.count;
+    for (let t = TIERS.length - 1; t >= 0; t--) {
+      const want = Math.floor(rem / TIERS[t].weight); rem -= want * TIERS[t].weight;
+      const have = this.soldiers.filter(s => s.tier === t);
+      if (have.length > want) {
+        const drop = new Set(have.slice(want));
+        this.soldiers = this.soldiers.filter(s => !drop.has(s));
+      } else if (have.length < want) {
+        for (let i = have.length; i < want; i++) this.soldiers.push(new Soldier(this.x + rand(-20, 20), this.y + (t ? 0 : rand(20, 60)), t));
+        if (t > 0 && grew && g.state === 'playing') {   // merge celebration
+          const T = TIERS[t];
+          g.particles.ring(this.x, this.y, T.color, 90 + t * 40, 0.7, 8);
+          g.particles.burst(this.x, this.y, T.color, 40, 320, 0.8, 5);
+          g.addText(this.x, this.y - this.radius - 40, `MERGE! ${T.name}`, T.color, 26, 1.6);
+          g.audio.levelUp(); g.shake = Math.max(g.shake, 6);
+        }
+      }
+    }
+    this.lastCount = this.count;
+    this.layout();
+    this.buildGuns();
+    // Firepower: linear up to MAX_GUNS soldiers, then diminishing; carried by wider, heavier bullets
+    const n = this.count, guns = this.guns.length;
+    this.eff = n <= MAX_GUNS ? n : MAX_GUNS * Math.pow(n / MAX_GUNS, ARMY_SCALING);
+    this.gunMult = guns ? this.eff / guns : 1;
+    this.bulletWidth = n <= MAX_GUNS ? 1 : clamp(1 + 0.45 * Math.log2(n / MAX_GUNS), 1, 5);
+  }
+  // Golden-angle spiral, biggest figures in the middle. Index 0 is the leader.
   layout() {
+    this.soldiers.sort((a, b) => b.tier - a.tier);
+    let acc = 0;
     this.soldiers.forEach((s, i) => {
-      const r = 10.5 * Math.sqrt(i), a = i * 2.39996;
+      const r = i === 0 ? 0 : Math.sqrt(acc / Math.PI) + s.rad * 0.4, a = i * 2.39996;
       s.ox = Math.cos(a) * r; s.oy = Math.sin(a) * r * 0.85 + r * 0.25;
+      acc += (s.rad * 2.1) ** 2;
     });
-    this.radius = 10.5 * Math.sqrt(this.soldiers.length) + 12;
+    this.radius = Math.sqrt(acc / Math.PI) + 10;
+  }
+  // Spread up to MAX_GUNS gun streams over the figures in proportion to how many soldiers each represents
+  buildGuns() {
+    const F = this.soldiers, n = Math.min(this.count, MAX_GUNS), old = this.guns;
+    this.guns = [];
+    if (!F.length) return;
+    let fi = 0, cum = F[0].weight;
+    for (let i = 0; i < n; i++) {
+      const target = (i + 0.5) / n * this.count;
+      while (cum < target && fi < F.length - 1) { fi++; cum += F[fi].weight; }
+      const f = F[fi];
+      this.guns.push({ fig: f, off: f.tier ? rand(-0.8, 0.8) * f.rad : 0, cd: old[i] ? old[i].cd : Math.random() * 0.6 });
+    }
   }
   update(dt) {
     const g = this.g, inp = g.input.axis(), sp = 230 * g.stats.move;
@@ -487,55 +567,74 @@ class Squad {
       if (s.flash > 0) s.flash -= dt;
       if (s.recoil > 0) s.recoil -= dt * 8;
       if (s.hp < s.maxHp) s.hp = Math.min(s.maxHp, s.hp + dt * 1.5);   // slow regen
+      if (s.wound > 0) s.wound = Math.max(0, s.wound - dt * 3);
       s.angle = Math.atan2(g.aim.y - s.y, g.aim.x - s.x);
-      s.cd -= dt;
-      if (s.cd <= 0) {
-        s.cd += (1 / rate) * rand(0.85, 1.15);
-        if (s.cd < 0) s.cd = 0.05;
-        g.fire(s, s.angle, bonus);
-        s.recoil = 1;
+    }
+    for (const gun of this.guns) {
+      gun.cd -= dt;
+      if (gun.cd <= 0) {
+        gun.cd += (1 / rate) * rand(0.85, 1.15);
+        if (gun.cd < 0) gun.cd = 0.05;
+        const f = gun.fig, fx = f.x + gun.off, fy = f.y;
+        g.fire(fx, fy, Math.atan2(g.aim.y - fy, g.aim.x - fx), bonus);
+        f.recoil = 1;
       }
     }
   }
-  // Remove dead soldiers, reinforce from reserves, re-form ranks
+  // Re-form ranks after deaths, merges or splits
   cleanup() {
-    let changed = false;
-    for (let i = this.soldiers.length - 1; i >= 0; i--) {
-      const s = this.soldiers[i];
-      if (s.dead) {
-        this.soldiers.splice(i, 1); changed = true;
-        if (this.reserves > 0) { this.reserves--; this.soldiers.push(new Soldier(s.x, s.y + 25)); }
-      }
-    }
-    if (changed) this.layout();
+    if (this.dirty || this.soldiers.some(s => s.dead)) this.sync();
   }
-  draw(ctx) {
-    const g = this.g;
-    drawGlow(ctx, this.x, this.y, '#2f8bff', this.radius * 1.7);
-    if (g.power.shield > 0) {
-      const a = 0.25 + Math.sin(g.time * 10) * 0.08;
-      ctx.fillStyle = hexA('#3ff6ff', a * 0.35); ctx.strokeStyle = hexA('#3ff6ff', a + 0.4); ctx.lineWidth = 3;
-      circle(ctx, this.x, this.y + this.radius * 0.15, this.radius + 18); ctx.fill(); ctx.stroke();
+  // Soft ground glow under the squad (drawn before the depth-sorted figures)
+  drawGround(ctx, g) {
+    const cam = g.cam; cam.p(this.x, this.y + this.radius * 0.15, 0);
+    g.local(cam.S, cam.X, cam.Y, cam.squash(cam.Z));
+    drawGlow(ctx, 0, 0, '#2f8bff', this.radius * 1.8);
+    g.screen();
+  }
+  drawShield(ctx, g) {
+    if (g.power.shield <= 0) return;
+    const cam = g.cam; cam.p(this.x, this.y + this.radius * 0.15, 0);
+    const R = (this.radius + 18) * cam.S, a = 0.25 + Math.sin(g.time * 10) * 0.08;
+    ctx.fillStyle = hexA('#3ff6ff', a * 0.3); ctx.strokeStyle = hexA('#3ff6ff', a + 0.4); ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.ellipse(cam.X, cam.Y - R * 0.3, R, R * 0.75, 0, 0, TAU); ctx.fill(); ctx.stroke();
+  }
+  // One soldier seen from behind. Local units: origin at the feet, -y is up.
+  drawSoldier(ctx, s, leader, g) {
+    const walk = this.moving ? Math.sin(s.bob) : 0, bob = Math.abs(walk) * 1.5;
+    const gx = Math.cos(s.angle), gy = Math.sin(s.angle) * 0.55, gn = Math.hypot(gx, gy) || 1, gl = 15 - s.recoil * 3;
+    // Legs (alternate while walking)
+    ctx.fillStyle = '#10263c';
+    ctx.fillRect(-4.5, -8 + Math.max(0, walk) * 2, 3.5, 8 - Math.max(0, walk) * 2);
+    ctx.fillRect(1, -8 + Math.max(0, -walk) * 2, 3.5, 8 - Math.max(0, -walk) * 2);
+    // Rifle first, so the body covers its stock when aiming down-range
+    const sy0 = -15 - bob, ex = 3 + gx / gn * gl, ey = sy0 + gy / gn * gl;
+    const T = TIERS[s.tier], gold = leader && s.tier === 0;
+    if (s.tier > 0) drawGlow(ctx, 0, -14, T.color, 22 + Math.sin(g.time * 4) * 2);   // merged soldiers radiate
+    ctx.strokeStyle = '#26323f'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(3, sy0); ctx.lineTo(ex, ey); ctx.stroke();
+    if (s.recoil > 0.6) drawGlow(ctx, ex, ey, WEAPONS[g.stats.weapon].color, 10);
+    // Torso + backpack
+    ctx.fillStyle = s.flash > 0 ? '#ff5a5a' : gold ? '#ffd23f' : T.color;
+    roundRect(ctx, -6, -19 - bob, 12, 12, 3); ctx.fill();
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    roundRect(ctx, -4, -18 - bob, 8, 7, 2); ctx.fill();
+    // Helmet
+    ctx.fillStyle = gold ? '#ffe680' : T.helmet; circle(ctx, 0, -23 - bob, 4.8); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.25)'; circle(ctx, -1.5, -24.5 - bob, 1.6); ctx.fill();
+    if (s.tier >= 3) {   // crown for the top tiers
+      ctx.fillStyle = '#ffe680'; ctx.beginPath(); ctx.moveTo(-4.5, -26.5 - bob);
+      for (const [px, py] of [[-4.5, -31], [-2, -28.5], [0, -32], [2, -28.5], [4.5, -31], [4.5, -26.5]]) ctx.lineTo(px, py - bob);
+      ctx.fill();
     }
-    // Draw back to front so the leader sits on top
-    for (let i = this.soldiers.length - 1; i >= 0; i--) {
-      const s = this.soldiers[i], leader = i === 0;
-      const by = Math.sin(s.bob) * 1.2, r = leader ? 9 : 7;
-      const ca = Math.cos(s.angle), sa = Math.sin(s.angle), gl = (leader ? 16 : 13) - s.recoil * 3;
-      ctx.strokeStyle = '#1d2733'; ctx.lineWidth = leader ? 4 : 3;
-      ctx.beginPath(); ctx.moveTo(s.x, s.y + by); ctx.lineTo(s.x + ca * gl, s.y + by + sa * gl); ctx.stroke();
-      ctx.fillStyle = s.flash > 0 ? '#ff5a5a' : leader ? '#ffd23f' : '#2fa8ff';
-      circle(ctx, s.x, s.y + by, r); ctx.fill();
-      ctx.fillStyle = leader ? '#b8860b' : '#15507f';
-      circle(ctx, s.x + ca * 1.5, s.y + by + sa * 1.5 - 1, r * 0.62); ctx.fill();
-      if (leader) {
-        ctx.strokeStyle = '#fff3b0'; ctx.lineWidth = 1.5; circle(ctx, s.x, s.y + by, r + 3); ctx.stroke();
-      }
-      if (s.recoil > 0.6) { drawGlow(ctx, s.x + ca * (gl + 3), s.y + by + sa * (gl + 3), WEAPONS[g.stats.weapon].color, 8); }
-      if (s.hp < s.maxHp) {
-        ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(s.x - 8, s.y - r - 6, 16, 3);
-        ctx.fillStyle = s.hp / s.maxHp > 0.5 ? '#3dff9a' : '#ff4a4a'; ctx.fillRect(s.x - 8, s.y - r - 6, 16 * s.hp / s.maxHp, 3);
-      }
+    if (leader) {   // command flag
+      ctx.strokeStyle = '#fff3b0'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(-4, -18 - bob); ctx.lineTo(-4, -37 - bob); ctx.stroke();
+      ctx.fillStyle = '#ffd23f'; ctx.beginPath(); ctx.moveTo(-4, -37 - bob); ctx.lineTo(5, -34 - bob); ctx.lineTo(-4, -31 - bob); ctx.fill();
+    }
+    if (s.tier === 0 && s.hp < s.maxHp) {
+      ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(-8, -33 - bob, 16, 3);
+      ctx.fillStyle = s.hp / s.maxHp > 0.5 ? '#3dff9a' : '#ff4a4a'; ctx.fillRect(-8, -33 - bob, 16 * s.hp / s.maxHp, 3);
     }
   }
 }
@@ -581,10 +680,13 @@ class Enemy {
     const kd = Math.exp(-8 * dt); this.kx *= kd; this.ky *= kd;
     this.x = clamp(this.x, this.r, g.W - this.r);
   }
-  draw(ctx) {
-    const x = this.x, y = this.y, r = this.r, t = this.t;
+  // Local units, origin at the feet. sdir = on-screen direction toward the squad.
+  draw(ctx, sdir) {
+    const hopSpd = this.type === 'runner' ? 14 : this.type === 'zombie' ? 6 : 4;
+    const hop = Math.abs(Math.sin(this.t * hopSpd + this.seed)) * this.r * 0.25;
+    const x = 0, y = -this.r - hop, r = this.r, t = this.t;
     drawGlow(ctx, x, y, this.color, r * (this.elite ? 2.8 : 2));
-    const ca = Math.cos(this.dir), sa = Math.sin(this.dir);
+    const ca = Math.cos(sdir), sa = Math.sin(sdir);
     const body = this.flash > 0 ? '#ffffff' : this.color;
     ctx.strokeStyle = this.color; ctx.lineWidth = 3;
     if (this.type === 'zombie') {   // reaching arms
@@ -687,7 +789,7 @@ class Boss {
     // Body contact crushes soldiers
     if (this.contactCd <= 0) {
       let hit = false;
-      for (const s of sq.soldiers) if (dist2(s.x, s.y, this.x, this.y) < (this.r + 8) ** 2) { g.damageSoldier(s, 30 * this.dmgScale); hit = true; }
+      for (const s of sq.soldiers) if (dist2(s.x, s.y, this.x, this.y) < (this.r + s.rad) ** 2) { g.damageSoldier(s, 30 * this.dmgScale, true); hit = true; }
       if (hit) { this.contactCd = 0.5; g.shake = Math.max(g.shake, 8); }
     }
   }
@@ -718,8 +820,8 @@ class Boss {
       }
     }
   }
-  draw(ctx) {
-    const x = this.x, y = this.y, r = this.r, t = this.t;
+  draw(ctx) {   // local units, origin at the feet
+    const x = 0, y = -this.r - 8 - Math.sin(this.t * 3) * 4, r = this.r, t = this.t;
     drawGlow(ctx, x, y, this.color, r * 2.6);
     const body = this.flash > 0 ? '#ffffff' : this.color;
     if (this.kind === 0) {           // BEHEMOTH — horned armoured brute
@@ -769,7 +871,9 @@ class GatePair {
   constructor(g, minR) {
     this.g = g; this.y = -70; this.h = 72; this.speed = 105; this.taken = -1; this.done = false;
     const a = makeGateOption(g, null, minR), b = makeGateOption(g, a.type.id, minR);
-    const hp = Math.round(100 * Math.pow(1.28, g.wave - 1));
+    // Gate toughness tracks the squad's current firepower, so shooting one open
+    // always takes a few seconds of focused fire no matter how strong you get
+    const hp = Math.round(Math.max(120, g.estimateDps() * GATE_OPEN_SECONDS));
     this.gates = [a, b].map(o => Object.assign(o, { hp, maxHp: hp, flash: 0 }));
   }
   update(dt) {
@@ -805,27 +909,28 @@ class GatePair {
     g.particles.ring(g.squad.x, g.squad.y, col, 140, 0.6, 6);
     g.squad.healAll();
   }
+  // Upright panels. Local units: x = world x, origin on the ground at the gate's near face, -y is up.
   draw(ctx) {
-    const g = this.g, W = g.W, y0 = this.y - this.h / 2;
+    const g = this.g, W = g.W, H = this.h;
     for (let i = 0; i < 2; i++) {
-      const gt = this.gates[i], x0 = i * W / 2 + 8, w = W / 2 - 16;
+      const gt = this.gates[i], x0 = i * W / 2 + 10, w = W / 2 - 20;
       const cc = CAT_COLOR[gt.type.cat], rc = RARITY[gt.rar].color;
-      const grd = ctx.createLinearGradient(0, y0, 0, y0 + this.h);
-      grd.addColorStop(0, hexA(cc, gt.flash > 0 ? 0.55 : 0.32)); grd.addColorStop(1, hexA(cc, 0.08));
-      ctx.fillStyle = grd; roundRect(ctx, x0, y0, w, this.h, 12); ctx.fill();
+      const grd = ctx.createLinearGradient(0, -H, 0, 0);
+      grd.addColorStop(0, hexA(cc, gt.flash > 0 ? 0.6 : 0.4)); grd.addColorStop(1, hexA(cc, 0.12));
+      ctx.fillStyle = grd; roundRect(ctx, x0, -H, w, H, 10); ctx.fill();
       ctx.shadowColor = rc; ctx.shadowBlur = 18; ctx.strokeStyle = rc; ctx.lineWidth = gt.rar >= 2 ? 4 : 3; ctx.stroke(); ctx.shadowBlur = 0;
       // Pillars
-      ctx.fillStyle = rc; ctx.fillRect(x0 - 3, y0 - 8, 6, this.h + 16); ctx.fillRect(x0 + w - 3, y0 - 8, 6, this.h + 16);
+      ctx.fillStyle = rc; ctx.fillRect(x0 - 4, -H - 14, 8, H + 14); ctx.fillRect(x0 + w - 4, -H - 14, 8, H + 14);
       // Label (auto-fit to width)
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       let fs = 26; ctx.font = `900 ${fs}px Segoe UI, sans-serif`;
       const mw = ctx.measureText(gt.label).width; if (mw > w * 0.88) { fs = Math.floor(fs * w * 0.88 / mw); ctx.font = `900 ${fs}px Segoe UI, sans-serif`; }
       ctx.fillStyle = '#ffffff'; ctx.shadowColor = cc; ctx.shadowBlur = 12;
-      ctx.fillText(gt.label, x0 + w / 2, this.y - 8); ctx.shadowBlur = 0;
+      ctx.fillText(gt.label, x0 + w / 2, -H * 0.62); ctx.shadowBlur = 0;
       ctx.font = '800 12px Segoe UI, sans-serif'; ctx.fillStyle = rc;
-      ctx.fillText(RARITY[gt.rar].name.toUpperCase() + (gt.type.weapon ? ' WEAPON' : ''), x0 + w / 2, this.y + 16);
+      ctx.fillText(RARITY[gt.rar].name.toUpperCase() + (gt.type.weapon ? ' WEAPON' : ''), x0 + w / 2, -H * 0.3);
       // Shoot-to-open bar
-      const bw = w * 0.6, bx = x0 + (w - bw) / 2, by = y0 + this.h - 9;
+      const bw = w * 0.6, bx = x0 + (w - bw) / 2, by = -10;
       ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.fillRect(bx, by, bw, 4);
       ctx.fillStyle = rc; ctx.fillRect(bx, by, bw * Math.max(0, 1 - gt.hp / gt.maxHp), 4);
     }
@@ -841,8 +946,8 @@ class Barrel {
     if (this.fuse > 0) { this.fuse -= dt; if (this.fuse <= 0) g.detonateBarrel(this); }
     if (this.y > g.H + 40) this.dead = true;
   }
-  draw(ctx, t) {
-    const x = this.x, y = this.y;
+  draw(ctx, t) {   // local units, origin at the base
+    const x = 0, y = -17;
     drawGlow(ctx, x, y, '#ff7b2e', 30 + Math.sin(t * 6) * 4);
     ctx.fillStyle = this.flash > 0 ? '#fff' : '#c4301c'; roundRect(ctx, x - 13, y - 17, 26, 34, 6); ctx.fill();
     ctx.fillStyle = '#7a1a0e'; ctx.fillRect(x - 13, y - 9, 26, 4); ctx.fillRect(x - 13, y + 5, 26, 4);
@@ -867,24 +972,66 @@ class Pickup {
     if (d < sq.radius + 10) { this.dead = true; g.collect(this); }
     if (this.life <= 0 || this.y > g.H + 30) this.dead = true;
   }
-  draw(ctx) {
+  draw(ctx) {   // local units, floating above the ground
     if (this.life < 3 && Math.sin(this.t * 20) > 0) return;  // blink before expiring
+    const x = 0, y = -16 - Math.sin(this.t * 3) * 3;
     if (this.kind === 'coin') {
-      drawGlow(ctx, this.x, this.y, '#ffd23f', 14);
+      drawGlow(ctx, x, y, '#ffd23f', 14);
       const sx = Math.abs(Math.cos(this.t * 5)) * 6 + 1;
-      ctx.fillStyle = '#ffd23f'; ctx.beginPath(); ctx.ellipse(this.x, this.y, sx, 6, 0, 0, TAU); ctx.fill();
-      ctx.fillStyle = '#fff6c0'; ctx.beginPath(); ctx.ellipse(this.x - sx * 0.3, this.y - 2, sx * 0.3, 2, 0, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#ffd23f'; ctx.beginPath(); ctx.ellipse(x, y, sx, 6, 0, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#fff6c0'; ctx.beginPath(); ctx.ellipse(x - sx * 0.3, y - 2, sx * 0.3, 2, 0, 0, TAU); ctx.fill();
     } else {
       const P = POWERUPS[this.kind], pulse = 1 + Math.sin(this.t * 6) * 0.1;
-      drawGlow(ctx, this.x, this.y, P.color, 34 * pulse);
+      drawGlow(ctx, x, y, P.color, 34 * pulse);
       ctx.strokeStyle = P.color; ctx.lineWidth = 3; ctx.fillStyle = 'rgba(5,8,20,.85)';
       ctx.beginPath();
-      for (let i = 0; i < 6; i++) { const a = i / 6 * TAU + this.t; ctx.lineTo(this.x + Math.cos(a) * 15 * pulse, this.y + Math.sin(a) * 15 * pulse); }
+      for (let i = 0; i < 6; i++) { const a = i / 6 * TAU + this.t; ctx.lineTo(x + Math.cos(a) * 15 * pulse, y + Math.sin(a) * 15 * pulse); }
       ctx.closePath(); ctx.fill(); ctx.stroke();
       ctx.fillStyle = P.color; ctx.font = '900 15px Segoe UI, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillText(P.icon, this.x, this.y + 1); ctx.textBaseline = 'alphabetic';
+      ctx.fillText(P.icon, x, y + 1); ctx.textBaseline = 'alphabetic';
     }
   }
+}
+
+/* ---------------- Camera: far third-person perspective ----------------
+   The simulation stays 2D on a ground plane (x = lateral, y = depth, smaller y
+   is further away). The camera sits behind and above the squad and projects
+   ground points (plus a height h) to the screen with a pinhole model. */
+class Camera {
+  constructor() { this.D = 520; this.camX = 320; this.camY = 1420; this.X = 0; this.Y = 0; this.S = 1; this.Z = 1; }
+  resize(cw, ch, W) {
+    // px per world unit at the near edge (portrait screens crop the road edges slightly so the squad stays readable)
+    this.k = Math.min(ch / 420, Math.max(cw * 0.98 / W, ch / 1100));
+    this.f = this.k * this.D;                          // focal length
+    this.baseHorizon = ch * 0.2;
+    this.camH = (ch - this.baseHorizon) / this.k;      // height so the near edge meets the screen bottom
+    this.baseCx = cw / 2;
+    this.cx = this.baseCx; this.horizon = this.baseHorizon;
+  }
+  // Ease toward a position behind the squad (partial follow keeps the arena readable)
+  follow(sq, g, dt, snap) {
+    const tx = g.W / 2 + (sq.x - g.W / 2) * 0.45;
+    const ty = g.H + this.D + (sq.y - (g.H - 130)) * 0.55;
+    const k = snap ? 1 : Math.min(1, dt * 4);
+    this.camX += (tx - this.camX) * k; this.camY += (ty - this.camY) * k;
+  }
+  // Project world (x, y) at height h -> this.X/this.Y (screen px), this.S (px per unit), this.Z (depth)
+  p(x, y, h = 0) {
+    let z = this.camY - y; if (z < 20) z = 20;
+    const s = this.f / z;
+    this.S = s; this.Z = z;
+    this.X = this.cx + (x - this.camX) * s;
+    this.Y = this.horizon + (this.camH - h) * s;
+    return s;
+  }
+  // Screen point -> world point on the plane at height h (mouse aiming)
+  unproject(sx, sy, h) {
+    let s = (sy - this.baseHorizon) / (this.camH - h);
+    const minS = this.f / 3000; if (s < minS) s = minS;
+    return { x: this.camX + (sx - this.baseCx) / s, y: this.camY - this.f / s };
+  }
+  squash(z) { return Math.min(1, this.camH / z); }      // vertical squash of a ground circle at depth z
+  fade(z) { return clamp((2000 - z) / 550, 0.2, 1); }   // distance fog
 }
 
 /* ---------------- 7. Game ---------------- */
@@ -894,6 +1041,9 @@ class Game {
     this.ctx = this.canvas.getContext('2d');
     this.audio = new AudioFX();
     this.particles = new Particles();
+    this.cam = new Camera();
+    this.drawList = [];
+    this.stars = Array.from({ length: 110 }, () => ({ x: Math.random(), y: Math.random(), s: rand(1, 2.2), a: rand(0.2, 0.8), p: rand(0, 6) }));
     this.grid = new Map();
     this.ui = {};
     ['hud', 'topBtns', 'hWave', 'hSoldiers', 'hWeapon', 'hWeaponR', 'hMods', 'hCoins', 'hScore', 'hKills', 'hLevel', 'hXp', 'combo', 'powers',
@@ -924,15 +1074,18 @@ class Game {
     const dpr = Math.min(window.devicePixelRatio || 1, 2), cw = window.innerWidth, ch = window.innerHeight;
     this.dpr = dpr; this.cw = cw; this.ch = ch;
     this.canvas.width = Math.round(cw * dpr); this.canvas.height = Math.round(ch * dpr);
-    this.H = VIEW_H; this.W = clamp(Math.round(cw / ch * VIEW_H), 420, 1300);
-    this.scale = Math.min(cw / this.W, ch / this.H);
-    this.ox = (cw - this.W * this.scale) / 2; this.oy = (ch - this.H * this.scale) / 2;
-    const c = this.ctx;
-    this.bgGrad = c.createLinearGradient(0, 0, 0, this.H);
-    this.bgGrad.addColorStop(0, '#0a0614'); this.bgGrad.addColorStop(0.5, '#071022'); this.bgGrad.addColorStop(1, '#0a1a2c');
+    this.H = VIEW_H; this.W = 640;   // the arena is a corridor seen from behind the squad
+    this.cam.resize(cw, ch, this.W);
+    const c = this.ctx, hz = this.cam.baseHorizon;
+    this.skyGrad = c.createLinearGradient(0, 0, 0, hz);
+    this.skyGrad.addColorStop(0, '#03020a'); this.skyGrad.addColorStop(0.65, '#170a2c'); this.skyGrad.addColorStop(1, '#4a1240');
+    this.groundGrad = c.createLinearGradient(0, hz, 0, ch);
+    this.groundGrad.addColorStop(0, '#140a26'); this.groundGrad.addColorStop(0.3, '#060c1a'); this.groundGrad.addColorStop(1, '#08142a');
+    this.fogGrad = c.createLinearGradient(0, hz, 0, hz + (ch - hz) * 0.32);
+    this.fogGrad.addColorStop(0, 'rgba(46,14,60,0.95)'); this.fogGrad.addColorStop(1, 'rgba(20,10,40,0)');
     this.vignette = c.createRadialGradient(cw / 2, ch / 2, Math.min(cw, ch) * 0.35, cw / 2, ch / 2, Math.max(cw, ch) * 0.75);
     this.vignette.addColorStop(0, 'rgba(0,0,0,0)'); this.vignette.addColorStop(1, 'rgba(0,0,0,0.6)');
-    if (this.squad) { this.squad.x = clamp(this.squad.x, 20, this.W - 20); }
+    if (this.squad) this.cam.follow(this.squad, this, 0, true);
   }
   reset() {
     Object.assign(this, {
@@ -949,6 +1102,7 @@ class Game {
     this.achieved = new Set();
     this.particles.clear();
     this.squad = new Squad(this); this.squad.add(5);
+    this.cam.follow(this.squad, this, 0, true);
     this.aim = { x: this.W / 2, y: 0 };
     this.hc = {};
   }
@@ -1040,23 +1194,34 @@ class Game {
   }
 
   /* ----- Combat ----- */
-  reserveBonus() { return 1 + Math.min(this.squad.reserves, 600) * 0.004; }
+  // Expected squad damage per second (mirrors Squad.update + fire), excluding temporary power-ups
+  estimateDps() {
+    const st = this.stats, w = WEAPONS[st.weapon];
+    let rate = w.rate * st.fireRate, bonus = 1;
+    const cap = w.rate * 3;
+    if (rate > cap) { bonus = rate / cap; rate = cap; }
+    // Wide spread-shot pellets mostly miss a focused target, so they aren't counted
+    const shots = w.pellets * (st.multishot > 1 ? 3 : 1);
+    const dmg = w.dmg * RARITY[st.weaponRarity].mult * st.damage * bonus * (1 + st.crit * 1.2);
+    return this.squad.eff * rate * shots * dmg;
+  }
   comboMult() { return 1 + Math.min(4, Math.floor(this.combo / 10) * 0.5); }
-  // Spawn one soldier's volley: base pellets + triple-shot + spread-shot extras
-  fire(s, a, bonus) {
-    const st = this.stats, w = WEAPONS[st.weapon], rm = RARITY[st.weaponRarity].mult;
-    const dmg = w.dmg * rm * st.damage * bonus * this.reserveBonus();
-    const mx = s.x + Math.cos(a) * 12, my = s.y + Math.sin(a) * 12;
+  // Spawn one gun stream's volley: base pellets + triple-shot + spread-shot extras.
+  // Past MAX_GUNS soldiers each bullet stands for many: it's wider, hits a bigger area and deals more damage.
+  fire(x, y, a, bonus) {
+    const st = this.stats, w = WEAPONS[st.weapon], rm = RARITY[st.weaponRarity].mult, sq = this.squad;
+    const dmg = w.dmg * rm * st.damage * bonus * sq.gunMult, wm = sq.bulletWidth;
+    const mx = x + Math.cos(a) * 12, my = y + Math.sin(a) * 12;
     const offs = [0];
     if (st.multishot > 1) offs.push(-0.13, 0.13);
     for (let l = 1; l <= st.spread; l++) offs.push(-0.22 - 0.2 * l, 0.22 + 0.2 * l);
-    const ex = w.explode * (1 + st.weaponRarity * 0.15);
+    const ex = w.explode * (1 + st.weaponRarity * 0.15) * (1 + (wm - 1) * 0.15), r = w.radius * (1 + (wm - 1) * 0.7);
     for (const o of offs) {
       for (let p = 0; p < w.pellets; p++) {
         if (this.bullets.length >= 1600) return;
         const pa = w.pellets > 1 ? (p / (w.pellets - 1) - 0.5) * w.spread + rand(-0.05, 0.05) : rand(-0.5, 0.5) * w.spread;
         const ang = a + o + pa, spd = w.speed * rand(0.95, 1.05);
-        this.bullets.push({ x: mx, y: my, vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd, dmg, life: w.life * rand(0.9, 1.1), pierce: w.pierce, hits: null, r: w.radius, explode: ex, len: w.len, color: w.color });
+        this.bullets.push({ x: mx, y: my, vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd, dmg, life: w.life * rand(0.9, 1.1), pierce: w.pierce, hits: null, r, wm, explode: ex, len: w.len, color: w.color });
       }
     }
     if (Math.random() < 0.3) this.particles.cone(mx, my, a, 0.4, w.color, 2, 160, 0.12, 3);
@@ -1070,7 +1235,7 @@ class Game {
   // Floating text (damage numbers, pickups, notifications)
   addText(x, y, text, color = '#fff', size = 14, life = 0.8) {
     if (this.texts.length > 90 && size < 20) return;
-    this.texts.push({ x, y, text, color, size, life, max: life, vy: -60 });
+    this.texts.push({ x, y, h: 30, text, color, size, life, max: life, vy: 70 });   // h = height above ground (rises)
   }
   damageEnemy(e, dmg, crit, quiet) {
     if (e.dead) return;
@@ -1113,15 +1278,29 @@ class Game {
     this.ui.bossBar.classList.add('hidden');
     this.showBanner('BOSS DEFEATED', `+${bonus} SOLDIERS · FULL HEAL · EPIC REWARDS`, '#ffd23f');
   }
-  damageSoldier(s, dmg) {
+  // area = splash damage (slams, mortars, barrels, cleaves): against a merged figure it
+  // catches many of the soldiers it represents, so it scales with the figure's size
+  damageSoldier(s, dmg, area = false) {
     if (s.dead || this.power.shield > 0) return;
-    s.hp -= dmg * Math.pow(0.85, this.stats.armour); s.flash = 0.15;
+    dmg *= Math.pow(0.85, this.stats.armour); s.flash = 0.15;
     this.audio.hurt();
-    if (s.hp <= 0) {
-      s.dead = true;
-      this.particles.burst(s.x, s.y, '#2fa8ff', 16, 200, 0.6, 4);
-      this.addText(s.x, s.y - 12, '-1', '#ff4a4a', 18);
-      this.hurtFlash = Math.min(0.5, this.hurtFlash + 0.18); this.shake = Math.max(this.shake, 4);
+    if (s.tier === 0) {
+      s.hp -= dmg;
+      if (s.hp <= 0) {
+        s.dead = true; this.squad.lose(1);
+        this.particles.burst(s.x, s.y, '#2fa8ff', 16, 200, 0.6, 4);
+        this.addText(s.x, s.y - 12, '-1', '#ff4a4a', 18);
+        this.hurtFlash = Math.min(0.5, this.hurtFlash + 0.18); this.shake = Math.max(this.shake, 4);
+      }
+    } else {
+      s.wound += area ? dmg * Math.sqrt(s.weight) * 2 : dmg;
+      const lost = Math.floor(s.wound / SOLDIER_HP);
+      if (lost > 0) {
+        s.wound -= lost * SOLDIER_HP; this.squad.lose(lost);
+        this.particles.burst(s.x, s.y, TIERS[s.tier].color, Math.min(30, 4 + lost), 220, 0.6, 4);
+        this.addText(s.x, s.y - s.rad * 3, '-' + lost.toLocaleString(), '#ff4a4a', 18);
+        this.hurtFlash = Math.min(0.5, this.hurtFlash + 0.12);
+      }
     }
   }
   // Area damage: rockets, barrels, nukes. Barrels caught in the blast chain-react.
@@ -1137,7 +1316,7 @@ class Game {
     }
     if (this.boss && this.boss.state !== 'enter' && dist2(x, y, this.boss.x, this.boss.y) < (radius + this.boss.r) ** 2) this.damageBoss(dmg * 0.8, false, x, y);
     for (const b of this.barrels) if (!b.dead && b.fuse <= 0 && dist2(x, y, b.x, b.y) < (radius + b.r) ** 2) b.fuse = 0.12;
-    if (hurtSoldiers) for (const s of this.squad.soldiers) if (dist2(x, y, s.x, s.y) < radius * radius) this.damageSoldier(s, 15);
+    if (hurtSoldiers) for (const s of this.squad.soldiers) if (dist2(x, y, s.x, s.y) < (radius + s.rad) ** 2) this.damageSoldier(s, 15, true);
     if (small) {
       this.particles.burst(x, y, '#ff9d3c', 10, 240, 0.4, 4);
       this.particles.ring(x, y, '#ff7b2e', radius, 0.3, 3);
@@ -1227,13 +1406,13 @@ class Game {
       if (dist2(e.x, e.y, sq.x, sq.y) > reach * reach) continue;
       for (const s of sq.soldiers) {
         if (s.dead) continue;
-        const rr = e.r + 7, dx = e.x - s.x, dy = e.y - s.y, d2 = dx * dx + dy * dy;
+        const rr = e.r + s.rad, dx = e.x - s.x, dy = e.y - s.y, d2 = dx * dx + dy * dy;
         if (d2 < rr * rr) {
           const d = Math.sqrt(d2) || 1;
           e.x = s.x + dx / d * rr; e.y = s.y + dy / d * rr;
           if (e.atk <= 0) {
             e.atk = e.atkCd; this.damageSoldier(s, e.dmg);
-            if (e.elite) { for (const o of sq.soldiers) if (o !== s && dist2(o.x, o.y, e.x, e.y) < (e.r + 30) ** 2) this.damageSoldier(o, e.dmg * 0.5); this.shake = Math.max(this.shake, 5); }
+            if (e.elite) { for (const o of sq.soldiers) if (o !== s && dist2(o.x, o.y, e.x, e.y) < (e.r + 30 + o.rad) ** 2) this.damageSoldier(o, e.dmg * 0.5, true); this.shake = Math.max(this.shake, 5); }
           }
         }
       }
@@ -1308,7 +1487,7 @@ class Game {
       let remove = b.life <= 0 || b.x < -30 || b.x > this.W + 30 || b.y < -200 || b.y > this.H + 30;
       if (!remove && dist2(b.x, b.y, sq.x, sq.y) < (sq.radius + 30) ** 2) {
         for (const s of sq.soldiers) {
-          if (dist2(b.x, b.y, s.x, s.y) < (b.r + 7) ** 2) {
+          if (dist2(b.x, b.y, s.x, s.y) < (b.r + s.rad) ** 2) {
             if (this.power.shield > 0) this.particles.burst(b.x, b.y, '#3ff6ff', 5, 120, 0.3, 3);
             this.damageSoldier(s, b.dmg); remove = true; break;
           }
@@ -1321,7 +1500,7 @@ class Game {
     for (let i = this.hazards.length - 1; i >= 0; i--) {
       const h = this.hazards[i]; h.t -= dt;
       if (h.t <= 0) {
-        for (const s of this.squad.soldiers) if (dist2(h.x, h.y, s.x, s.y) < h.r * h.r) this.damageSoldier(s, h.dmg);
+        for (const s of this.squad.soldiers) if (dist2(h.x, h.y, s.x, s.y) < (h.r + s.rad * 0.5) ** 2) this.damageSoldier(s, h.dmg, true);
         this.particles.burst(h.x, h.y, h.color, 30, 320, 0.6, 5);
         this.particles.ring(h.x, h.y, h.color, h.r * 1.2, 0.4, 6);
         this.shake = Math.max(this.shake, 10); this.audio.explosion(false);
@@ -1343,7 +1522,8 @@ class Game {
       const ty = best ? best.y : this.squad.y - 400;
       this.aim.x += (tx - this.aim.x) * 0.3; this.aim.y += (ty - this.aim.y) * 0.3;
     } else {
-      this.aim.x = (inp.mouse.sx - this.ox) / this.scale; this.aim.y = (inp.mouse.sy - this.oy) / this.scale;
+      const w = this.cam.unproject(inp.mouse.sx, inp.mouse.sy, 14);   // cursor ray hits the plane at gun height
+      this.aim.x = w.x; this.aim.y = w.y;
     }
   }
 
@@ -1359,6 +1539,7 @@ class Game {
     this.updateDirector(dt);
     this.computeAim();
     this.squad.update(dt);
+    this.cam.follow(this.squad, this, dt);
     for (const e of this.enemies) e.update(dt);
     if (this.boss) this.boss.update(dt);
     this.buildGrid();
@@ -1369,7 +1550,7 @@ class Game {
     for (const b of this.barrels) b.update(dt, this);
     for (const p of this.pickups) p.update(dt, this);
     this.particles.update(dt);
-    for (const t of this.texts) { t.life -= dt; t.y += t.vy * dt; t.vy *= Math.exp(-2 * dt); }
+    for (const t of this.texts) { t.life -= dt; t.h += t.vy * dt; t.vy *= Math.exp(-2 * dt); }
 
     // Remove dead/expired objects (swap-free filters keep code simple)
     this.enemies = this.enemies.filter(e => !e.dead);
@@ -1377,7 +1558,7 @@ class Game {
     this.pickups = this.pickups.filter(p => !p.dead);
     this.texts = this.texts.filter(t => t.life > 0);
     this.squad.cleanup();
-    if (this.squad.soldiers.length === 0) { this.gameOver(); return; }
+    if (this.squad.count === 0) { this.gameOver(); return; }
 
     this.achTimer -= dt;
     if (this.achTimer <= 0) { this.achTimer = 0.5; this.checkAchievements(); }
@@ -1408,13 +1589,13 @@ class Game {
   updateHUD() {
     const st = this.stats, sq = this.squad, R = RARITY[st.weaponRarity];
     this.setText('hWave', this.wave);
-    this.setText('hSoldiers', sq.reserves > 0 ? `${sq.soldiers.length} +${sq.reserves}` : sq.soldiers.length);
+    this.setText('hSoldiers', sq.count.toLocaleString());
     this.setText('hWeapon', WEAPONS[st.weapon].name);
     this.setText('hWeaponR', R.name + ' weapon');
     if (this.hc.wc !== R.color) { this.hc.wc = R.color; this.ui.hWeapon.style.color = R.color; this.ui.hWeapon.style.textShadow = `0 0 10px ${R.color}`; }
     const mods = [];
     if (st.multishot > 1) mods.push('TRIPLE'); if (st.spread) mods.push('SPREAD ' + st.spread);
-    mods.push(`DMG ${Math.round(st.damage * this.reserveBonus() * 100)}%`, `ROF ${Math.round(st.fireRate * 100)}%`, `CRIT ${Math.round(st.crit * 100)}%`);
+    mods.push(`DMG ${Math.round(st.damage * 100)}%`, `ROF ${Math.round(st.fireRate * 100)}%`, `CRIT ${Math.round(st.crit * 100)}%`);
     if (st.armour > 0) mods.push(`ARM ${Math.round((1 - Math.pow(0.85, st.armour)) * 100)}%`);
     this.setText('hMods', mods.join(' · '));
     this.setText('hCoins', this.coins.toLocaleString());
@@ -1441,71 +1622,164 @@ class Game {
   }
 
   /* ----- Rendering ----- */
+  // Transform helpers: local() maps an entity's local units (origin at its feet) to the screen
+  local(S, X, Y, sy = 1) { const d = this.dpr; this.ctx.setTransform(d * S, 0, 0, d * S * sy, d * X, d * Y); }
+  screen() { const d = this.dpr; this.ctx.setTransform(d, 0, 0, d, 0, 0); }
+  // Line between two projected world points
+  pline(ctx, x1, y1, h1, x2, y2, h2) {
+    const cam = this.cam; cam.p(x1, y1, h1); ctx.moveTo(cam.X, cam.Y); cam.p(x2, y2, h2); ctx.lineTo(cam.X, cam.Y);
+  }
+  // Sky, perspective ground grid, road, neon rails and roadside pylons
   drawBackground(ctx) {
-    const W = this.W, H = this.H;
-    ctx.fillStyle = this.bgGrad; ctx.fillRect(0, 0, W, H);
-    // Scrolling grid gives a sense of the squad advancing
-    ctx.strokeStyle = 'rgba(60,130,255,0.07)'; ctx.lineWidth = 1; ctx.beginPath();
-    const off = this.scroll % 60;
-    for (let x = (W / 2) % 60; x < W; x += 60) { ctx.moveTo(x, 0); ctx.lineTo(x, H); }
-    for (let y = off - 60; y < H; y += 60) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+    const cam = this.cam, cw = this.cw, ch = this.ch, hz = cam.horizon, W = this.W;
+    ctx.fillStyle = this.skyGrad; ctx.fillRect(0, 0, cw, hz + 2);
+    ctx.fillStyle = '#ffffff';
+    for (const s of this.stars) { ctx.globalAlpha = s.a * (0.6 + 0.4 * Math.sin(this.time * 2 + s.p)); ctx.fillRect(s.x * cw, s.y * hz * 0.95, s.s, s.s); }
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = this.groundGrad; ctx.fillRect(0, hz, cw, ch - hz);
+    const yFar = cam.camY - 4000, yNear = cam.camY - 30, far = cam.camY - 2600;
+    // Road surface
+    ctx.fillStyle = '#0b1830'; ctx.beginPath();
+    cam.p(0, yFar); ctx.moveTo(cam.X, cam.Y); cam.p(W, yFar); ctx.lineTo(cam.X, cam.Y);
+    cam.p(W, yNear); ctx.lineTo(cam.X, cam.Y); cam.p(0, yNear); ctx.lineTo(cam.X, cam.Y); ctx.fill();
+    // Grid scrolls toward the camera: the squad is advancing
+    ctx.strokeStyle = 'rgba(60,130,255,0.14)'; ctx.lineWidth = 1; ctx.beginPath();
+    for (let x = -640; x <= W + 640; x += 64) this.pline(ctx, x, yFar, 0, x, yNear, 0);
+    for (let y = Math.floor(yNear / 60) * 60 + this.scroll % 60; y > far; y -= 60) this.pline(ctx, -640, y, 0, W + 640, y, 0);
     ctx.stroke();
-    ctx.fillStyle = 'rgba(120,200,255,0.06)';
-    for (let y = (this.scroll % 90) - 90; y < H; y += 90) ctx.fillRect(W / 2 - 2, y, 4, 40);
-    // Neon side rails
-    for (const x of [6, W - 6]) {
-      ctx.fillStyle = 'rgba(63,246,255,0.5)'; ctx.fillRect(x - 1.5, 0, 3, H);
-      ctx.fillStyle = 'rgba(63,246,255,0.07)'; ctx.fillRect(x - 10, 0, 20, H);
+    // Darken off-road ground
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    for (const [a, b] of [[-3000, 0], [W, W + 3000]]) {
+      ctx.beginPath(); cam.p(a, yFar); ctx.moveTo(cam.X, cam.Y); cam.p(b, yFar); ctx.lineTo(cam.X, cam.Y);
+      cam.p(b, yNear); ctx.lineTo(cam.X, cam.Y); cam.p(a, yNear); ctx.lineTo(cam.X, cam.Y); ctx.fill();
     }
-    // Danger zone tint at the top where enemies emerge
-    const g = ctx.createLinearGradient(0, 0, 0, 120);
-    g.addColorStop(0, 'rgba(255,40,80,0.18)'); g.addColorStop(1, 'rgba(255,40,80,0)');
-    ctx.fillStyle = g; ctx.fillRect(0, 0, W, 120);
+    // Centre lane dashes
+    ctx.fillStyle = 'rgba(120,200,255,0.12)';
+    for (let y = Math.floor(yNear / 90) * 90 + this.scroll % 90; y > far; y -= 90) {
+      ctx.beginPath(); cam.p(W / 2 - 3, y); ctx.moveTo(cam.X, cam.Y); cam.p(W / 2 + 3, y); ctx.lineTo(cam.X, cam.Y);
+      cam.p(W / 2 + 3, y - 40); ctx.lineTo(cam.X, cam.Y); cam.p(W / 2 - 3, y - 40); ctx.lineTo(cam.X, cam.Y); ctx.fill();
+    }
+    ctx.fillStyle = this.fogGrad; ctx.fillRect(0, hz, cw, (ch - hz) * 0.32);
+    // Neon rails, posts and pylons (additive glow)
+    ctx.globalCompositeOperation = 'lighter';
+    for (const x of [0, W]) {
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = 'rgba(63,246,255,0.75)'; ctx.beginPath(); this.pline(ctx, x, yFar, 12, x, yNear, 12); ctx.stroke();
+      ctx.strokeStyle = 'rgba(63,246,255,0.3)'; ctx.beginPath(); this.pline(ctx, x, yFar, 0, x, yNear, 0); ctx.stroke();
+      ctx.strokeStyle = 'rgba(63,246,255,0.45)'; ctx.beginPath();
+      for (let y = Math.floor(yNear / 120) * 120 + this.scroll % 120; y > far; y -= 120) this.pline(ctx, x, y, 0, x, y, 14);
+      ctx.stroke();
+    }
+    for (const x of [-120, W + 120]) {
+      for (let y = Math.floor(yNear / 400) * 400 + this.scroll % 400; y > cam.camY - 3400; y -= 400) {
+        cam.p(x, y, 0); if (cam.Z < 60) continue;
+        const X0 = cam.X, Y0 = cam.Y, S = cam.S; cam.p(x, y, 170);
+        ctx.strokeStyle = 'rgba(255,60,140,0.4)'; ctx.lineWidth = Math.max(1, 3 * S);
+        ctx.beginPath(); ctx.moveTo(X0, Y0); ctx.lineTo(cam.X, cam.Y); ctx.stroke();
+        drawGlow(ctx, cam.X, cam.Y, '#ff3c8c', 24 * S + 4);
+      }
+    }
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = 'rgba(255,90,160,0.35)'; ctx.fillRect(0, hz - 1, cw, 2);   // horizon line
+  }
+  // Ground shadows anchor every standing figure to the floor
+  drawShadows(ctx) {
+    const cam = this.cam;
+    ctx.fillStyle = 'rgba(0,0,0,0.38)'; ctx.beginPath();
+    const add = (x, y, r) => {
+      cam.p(x, y, 0); if (cam.Z < 40) return;
+      const R = r * cam.S; ctx.moveTo(cam.X + R, cam.Y); ctx.ellipse(cam.X, cam.Y, R, R * cam.squash(cam.Z), 0, 0, TAU);
+    };
+    for (const s of this.squad.soldiers) add(s.x, s.y, s.rad);
+    for (const e of this.enemies) add(e.x, e.y, e.r);
+    for (const b of this.barrels) add(b.x, b.y, 14);
+    for (const p of this.pickups) add(p.x, p.y, 7);
+    if (this.boss) add(this.boss.x, this.boss.y, this.boss.r);
+    ctx.fill();
+  }
+  // Painter's algorithm: draw everything standing on the ground from far to near
+  drawEntities(ctx) {
+    const L = this.drawList, cam = this.cam, sq = this.squad; L.length = 0;
+    for (const e of this.enemies) L.push(e);
+    for (const s of sq.soldiers) L.push(s);
+    for (const b of this.barrels) L.push(b);
+    for (const p of this.pickups) L.push(p);
+    if (this.boss) L.push(this.boss);
+    if (this.gatePair) L.push(this.gatePair);
+    for (const o of L) o._d = o instanceof GatePair ? o.y + o.h / 2 : o.y;
+    L.sort((a, b) => a._d - b._d);
+    cam.p(sq.x, sq.y, 10); const qX = cam.X, qY = cam.Y;
+    for (const o of L) {
+      if (o instanceof GatePair) {
+        cam.p(0, o._d, 0); if (cam.Z < 40) continue;
+        this.local(cam.S, cam.X, cam.Y); o.draw(ctx); continue;
+      }
+      cam.p(o.x, o.y, 0); if (cam.Z < 40) continue;
+      const X = cam.X, Y = cam.Y, S = cam.S;
+      ctx.globalAlpha = cam.fade(cam.Z);
+      if (o instanceof Soldier) { const leader = o === sq.soldiers[0]; this.local(S * o.scale * (leader && o.tier === 0 ? 1.2 : 1), X, Y); sq.drawSoldier(ctx, o, leader, this); }
+      else if (o instanceof Enemy) { const sdir = Math.atan2(qY - (Y - o.r * S), qX - X); this.local(S, X, Y); o.draw(ctx, sdir); }
+      else if (o instanceof Barrel) { this.local(S, X, Y); o.draw(ctx, this.time); }
+      else { this.local(S, X, Y); o.draw(ctx); }
+    }
+    ctx.globalAlpha = 1; this.screen();
   }
   drawBullets(ctx) {
+    const cam = this.cam, BH = 13;   // bullets fly at gun height
     ctx.globalCompositeOperation = 'lighter'; ctx.lineCap = 'round';
-    // Batch straight bullets into as few stroke calls as possible
-    let color = null;
+    // Batch straight bullets into as few stroke calls as possible (new batch when colour or width changes)
+    let color = null, wm = 0;
     for (let pass = 0; pass < 2; pass++) {
-      ctx.lineWidth = pass === 0 ? 6 : 2.2; ctx.globalAlpha = pass === 0 ? 0.25 : 1;
-      color = null; ctx.beginPath();
+      const base = pass === 0 ? 5 : 2; ctx.globalAlpha = pass === 0 ? 0.3 : 1;
+      color = null; wm = 0; ctx.beginPath();
       for (const b of this.bullets) {
-        if (b.explode) continue;
-        if (b.color !== color) { if (color) ctx.stroke(); ctx.beginPath(); color = b.color; ctx.strokeStyle = color; }
+        if (b.explode || cam.camY - b.y < 40) continue;
+        if (b.color !== color || b.wm !== wm) {
+          if (color) ctx.stroke();
+          ctx.beginPath(); color = b.color; wm = b.wm; ctx.strokeStyle = color; ctx.lineWidth = base * wm;
+        }
         const sp = Math.hypot(b.vx, b.vy) || 1;
-        ctx.moveTo(b.x, b.y); ctx.lineTo(b.x - b.vx / sp * b.len, b.y - b.vy / sp * b.len);
+        this.pline(ctx, b.x, b.y, BH, b.x - b.vx / sp * b.len, b.y - b.vy / sp * b.len, BH);
       }
       if (color) ctx.stroke();
     }
     ctx.globalAlpha = 1;
     for (const b of this.bullets) {
       if (!b.explode) continue;
-      drawGlow(ctx, b.x, b.y, '#ff4d5e', 16);
-      ctx.fillStyle = '#ffd0a0'; circle(ctx, b.x, b.y, 4); ctx.fill();
+      cam.p(b.x, b.y, BH); if (cam.Z < 40) continue;
+      drawGlow(ctx, cam.X, cam.Y, '#ff4d5e', 16 * cam.S * b.wm);
+      ctx.fillStyle = '#ffd0a0'; circle(ctx, cam.X, cam.Y, 4 * cam.S * b.wm); ctx.fill();
     }
     // Enemy projectiles
     for (const b of this.eBullets) {
-      drawGlow(ctx, b.x, b.y, b.color, b.r * 3);
-      ctx.fillStyle = '#ffffff'; circle(ctx, b.x, b.y, b.r * 0.55); ctx.fill();
+      cam.p(b.x, b.y, 12); if (cam.Z < 40) continue;
+      drawGlow(ctx, cam.X, cam.Y, b.color, b.r * 3 * cam.S);
+      ctx.fillStyle = '#ffffff'; circle(ctx, cam.X, cam.Y, b.r * 0.55 * cam.S); ctx.fill();
     }
     ctx.globalCompositeOperation = 'source-over'; ctx.lineCap = 'butt';
   }
+  // Boss attack telegraphs, drawn as ellipses on the ground
   drawHazards(ctx) {
+    const cam = this.cam;
     for (const h of this.hazards) {
-      const p = 1 - h.t / h.max;
-      ctx.fillStyle = hexA(h.color, 0.08 + p * 0.22); circle(ctx, h.x, h.y, h.r); ctx.fill();
-      ctx.strokeStyle = hexA(h.color, 0.9); ctx.lineWidth = 2; circle(ctx, h.x, h.y, h.r); ctx.stroke();
-      ctx.lineWidth = 3; circle(ctx, h.x, h.y, h.r * p); ctx.stroke();
-      ctx.fillStyle = h.color; ctx.font = '900 20px Segoe UI'; ctx.textAlign = 'center'; ctx.fillText('!', h.x, h.y + 7);
+      cam.p(h.x, h.y, 0); if (cam.Z < 40) continue;
+      const p = 1 - h.t / h.max, R = h.r * cam.S, q = cam.squash(cam.Z);
+      ctx.fillStyle = hexA(h.color, 0.08 + p * 0.22); ctx.beginPath(); ctx.ellipse(cam.X, cam.Y, R, R * q, 0, 0, TAU); ctx.fill();
+      ctx.strokeStyle = hexA(h.color, 0.9); ctx.lineWidth = 2; ctx.stroke();
+      ctx.lineWidth = 3; ctx.beginPath(); ctx.ellipse(cam.X, cam.Y, R * p, R * p * q, 0, 0, TAU); ctx.stroke();
+      ctx.fillStyle = h.color; ctx.font = `900 ${Math.round(22 * cam.S)}px Segoe UI`; ctx.textAlign = 'center'; ctx.fillText('!', cam.X, cam.Y + 6 * cam.S);
     }
   }
   drawTexts(ctx) {
+    const cam = this.cam;
     ctx.textAlign = 'center'; ctx.lineJoin = 'round';
     for (const t of this.texts) {
-      const a = Math.min(1, t.life / t.max * 2.5), s = t.size * (t.life > t.max - 0.1 ? 1.25 : 1);
+      cam.p(t.x, t.y, t.h); if (cam.Z < 40) continue;
+      const sc = clamp(cam.S / cam.k * 1.25, 0.55, 1.5);
+      const a = Math.min(1, t.life / t.max * 2.5), s = Math.round(t.size * sc * (t.life > t.max - 0.1 ? 1.25 : 1));
       ctx.globalAlpha = a; ctx.font = `900 ${s}px Segoe UI, sans-serif`;
-      ctx.strokeStyle = 'rgba(0,0,0,0.75)'; ctx.lineWidth = 3; ctx.strokeText(t.text, t.x, t.y);
-      ctx.fillStyle = t.color; ctx.fillText(t.text, t.x, t.y);
+      ctx.strokeStyle = 'rgba(0,0,0,0.75)'; ctx.lineWidth = 3; ctx.strokeText(t.text, cam.X, cam.Y);
+      ctx.fillStyle = t.color; ctx.fillText(t.text, cam.X, cam.Y);
     }
     ctx.globalAlpha = 1;
   }
@@ -1526,38 +1800,36 @@ class Game {
     ctx.fillStyle = 'rgba(200,230,255,.6)'; ctx.font = '700 9px Segoe UI'; ctx.textAlign = 'left'; ctx.fillText('RADAR', x + 5, y + 11);
   }
   render() {
-    const ctx = this.ctx, dpr = this.dpr;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = '#020309'; ctx.fillRect(0, 0, this.cw, this.ch);
-    const sh = this.state === 'playing' ? this.shake : 0, sx = rand(-1, 1) * sh, sy = rand(-1, 1) * sh;
-    const s = this.scale * dpr;
-    ctx.setTransform(s, 0, 0, s, (this.ox + sx) * dpr, (this.oy + sy) * dpr);
-    ctx.save();
-    ctx.beginPath(); ctx.rect(0, 0, this.W, this.H); ctx.clip();
+    const ctx = this.ctx, cam = this.cam;
+    this.screen();
+    // Screen shake nudges the camera's optical centre
+    const sh = this.state === 'playing' ? this.shake : 0;
+    cam.cx = cam.baseCx + rand(-1, 1) * sh; cam.horizon = cam.baseHorizon + rand(-1, 1) * sh;
     this.drawBackground(ctx);
     if (this.state !== 'menu') {
       this.drawHazards(ctx);
-      if (this.gatePair) this.gatePair.draw(ctx);
-      for (const b of this.barrels) b.draw(ctx, this.time);
-      for (const p of this.pickups) p.draw(ctx);
-      for (const e of this.enemies) e.draw(ctx);
-      if (this.boss) this.boss.draw(ctx);
-      this.squad.draw(ctx);
+      this.squad.drawGround(ctx, this);
+      this.drawShadows(ctx);
+      // Bullets fly low and ahead of the shooters, so figures (including giant merged soldiers) are drawn over them
       this.drawBullets(ctx);
-      this.particles.draw(ctx);
+      this.drawEntities(ctx);
+      this.squad.drawShield(ctx, this);
+      this.particles.draw(ctx, cam);
       this.drawTexts(ctx);
-      // Mouse crosshair
+      // Crosshair at the cursor plus a ground marker where the shots land
       if (!this.input.isTouch && !this.input.autoAim && this.input.mouse.active && this.state === 'playing') {
-        ctx.strokeStyle = 'rgba(63,246,255,0.8)'; ctx.lineWidth = 2;
-        circle(ctx, this.aim.x, this.aim.y, 12); ctx.stroke();
-        ctx.beginPath(); ctx.moveTo(this.aim.x - 18, this.aim.y); ctx.lineTo(this.aim.x - 6, this.aim.y); ctx.moveTo(this.aim.x + 6, this.aim.y); ctx.lineTo(this.aim.x + 18, this.aim.y);
-        ctx.moveTo(this.aim.x, this.aim.y - 18); ctx.lineTo(this.aim.x, this.aim.y - 6); ctx.moveTo(this.aim.x, this.aim.y + 6); ctx.lineTo(this.aim.x, this.aim.y + 18); ctx.stroke();
+        const mx = this.input.mouse.sx, my = this.input.mouse.sy;
+        cam.p(this.aim.x, this.aim.y, 0);
+        if (cam.Z > 40) { const R = 14 * cam.S; ctx.strokeStyle = 'rgba(63,246,255,0.35)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.ellipse(cam.X, cam.Y, R, R * cam.squash(cam.Z), 0, 0, TAU); ctx.stroke(); }
+        ctx.strokeStyle = 'rgba(63,246,255,0.85)'; ctx.lineWidth = 2;
+        circle(ctx, mx, my, 12); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(mx - 18, my); ctx.lineTo(mx - 6, my); ctx.moveTo(mx + 6, my); ctx.lineTo(mx + 18, my);
+        ctx.moveTo(mx, my - 18); ctx.lineTo(mx, my - 6); ctx.moveTo(mx, my + 6); ctx.lineTo(mx, my + 18); ctx.stroke();
       }
-      if (this.power.freeze > 0) { ctx.fillStyle = 'rgba(150,210,255,0.08)'; ctx.fillRect(0, 0, this.W, this.H); }
+      if (this.power.freeze > 0) { ctx.fillStyle = 'rgba(150,210,255,0.08)'; ctx.fillRect(0, 0, this.cw, this.ch); }
     }
-    ctx.restore();
+    cam.cx = cam.baseCx; cam.horizon = cam.baseHorizon;
     // ---- Screen-space overlays ----
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = this.vignette; ctx.fillRect(0, 0, this.cw, this.ch);
     if (this.hurtFlash > 0) { ctx.fillStyle = `rgba(255,30,50,${this.hurtFlash * 0.4})`; ctx.fillRect(0, 0, this.cw, this.ch); }
     if (this.whiteFlash > 0) { ctx.fillStyle = `rgba(255,255,255,${this.whiteFlash})`; ctx.fillRect(0, 0, this.cw, this.ch); }
