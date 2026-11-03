@@ -58,6 +58,25 @@ canvas{display:block;position:absolute;inset:0;width:100%;height:100%;cursor:cro
 .stats{display:grid;grid-template-columns:auto auto;gap:4px 24px;font-size:17px;margin:10px 0 18px;text-align:left}
 .stats span:nth-child(odd){opacity:.65}
 .stats span:nth-child(even){font-weight:800;text-align:right}
+.btn.small{padding:9px 20px;font-size:14px;background:linear-gradient(180deg,#d7a8ff,#8a4dff);box-shadow:0 0 20px rgba(160,90,255,.45)}
+.medals{color:#ffd23f;font-weight:900;letter-spacing:2px}
+
+/* ---------- Medal shop / achievements ---------- */
+#shop{justify-content:flex-start}
+#shop h1{font-size:clamp(30px,6vw,56px)}
+.tabs{display:flex;gap:8px;margin:6px 0 12px}
+.tabs button{padding:7px 18px;border-radius:10px;border:1px solid rgba(90,200,255,.35);background:rgba(10,16,34,.8);color:#cfe8ff;font-weight:800;letter-spacing:2px;cursor:pointer}
+.tabs button.on{background:rgba(40,110,200,.85);color:#fff}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px;width:min(760px,94vw);margin-bottom:14px}
+.card{background:rgba(10,18,40,.8);border:1px solid rgba(90,200,255,.25);border-radius:12px;padding:10px 12px;text-align:left;font-size:13px}
+.card .n{font-weight:900;font-size:15px;letter-spacing:1px}
+.card .d{opacity:.75;margin:2px 0 6px;min-height:18px}
+.card .pips{letter-spacing:2px;color:#3ff6ff;font-size:11px}
+.card button{margin-top:6px;width:100%;padding:6px;border-radius:8px;border:none;font-weight:900;cursor:pointer;background:linear-gradient(180deg,#ffd76a,#ff8a2a);color:#201000}
+.card button:disabled{background:#2a3048;color:#7a84a0;cursor:default}
+.card.locked{opacity:.45}
+.card.got{border-color:#ffd23f;box-shadow:0 0 12px rgba(255,210,63,.25)}
+.card .rw{color:#ffd23f;font-size:11px;font-weight:800}
 </style>
 </head>
 <body>
@@ -92,7 +111,17 @@ canvas{display:block;position:absolute;inset:0;width:100%;height:100%;cursor:cro
     <div style="margin-top:6px;opacity:.75">Shoot <span style="color:#ff7b2e">explosive barrels</span>, grab glowing power-ups, chain kills for combo multipliers. A boss arrives every 5 waves.</div>
   </div>
   <button class="btn" id="btnPlay">DEPLOY</button>
+  <button class="btn small" id="btnShop1">🎖 ARMORY &amp; ACHIEVEMENTS</button>
+  <div class="medals" id="menuMedals"></div>
   <div id="bestTxt" style="margin-top:10px;opacity:.7"></div>
+</div>
+
+<div id="shop" class="overlay hidden">
+  <h1>ARMORY</h1>
+  <div class="medals" id="shopMedals"></div>
+  <div class="tabs"><button id="tabUp" class="on">UPGRADES</button><button id="tabAch">ACHIEVEMENTS</button></div>
+  <div class="grid" id="shopGrid"></div>
+  <button class="btn" id="btnShopBack">BACK</button>
 </div>
 
 <div id="pauseMenu" class="overlay hidden">
@@ -107,6 +136,7 @@ canvas{display:block;position:absolute;inset:0;width:100%;height:100%;cursor:cro
   <h3>YOUR ARMY HAS FALLEN</h3>
   <div class="stats" id="overStats"></div>
   <button class="btn" id="btnRestart2">REDEPLOY</button>
+  <button class="btn small" id="btnShop2">🎖 SPEND MEDALS</button>
 </div>
 
 <script>
@@ -135,6 +165,23 @@ const MAX_ARMY = 100000;      // absolute soldier cap
 const MAX_GUNS = 50;          // bullet streams; beyond this, bullets get wider/stronger instead of more numerous
 const ARMY_SCALING = 0.6;     // firepower above MAX_GUNS soldiers grows as (n/50)^0.6 (keeps huge armies from trivialising waves)
 const SOLDIER_HP = 30;
+// Difficulty: enemy stats compound per wave, and also scale with squad strength so upgrades can't outrun them
+const HP_GROWTH = 1.08;       // enemy HP curve = (1 + 0.12(n-1)) * HP_GROWTH^(n-1)
+const DMG_GROWTH = 1.065;     // enemy damage = DMG_GROWTH^(n-1)
+const ADAPT_EXP = 0.55;       // enemy HP is at least (squad DPS / starting DPS)^ADAPT_EXP
+const BOSS_MIN_SECONDS = 18;  // a boss always has at least this many seconds of estimated squad DPS as HP
+const VIEW_DIST = 7000;       // how far ahead (world units from the camera) the road, grid and pylons are drawn
+const FOG_FRAC = 0.16;        // share of the ground (from the horizon down) covered by the horizon fog band
+const SPAWN_FAR = -650, SPAWN_NEAR = -250;   // enemies spawn in this y band (beyond the far edge of the field, y < 0)
+const ENTRY_SPEED = 110;      // minimum walk speed until an enemy reaches the field, so far spawns don't drag waves out
+const BULLET_RANGE = 1.6;     // multiplier on every weapon's bullet lifetime (= range)
+const MAX_BULLETS = 2000;     // longer-lived bullets mean more alive at once
+const MAX_ROCKET_GLOWS = 150; // rockets beyond this many on screen are drawn without their glow sprite (fill-rate guard)
+const MAX_LINE_WIDTH = 4;     // visual cap on bullet-width multiplier for straight bullets (very thick additive lines are costly)
+// Fog bank at the far edge of the field: things beyond FOG_FAR are hidden, and they fade in fully by FOG_CLEAR
+const FOG_FAR = -560, FOG_CLEAR = -40;
+const FOG_COLOR = '#4b3a78';
+function fogAlpha(y) { const t = clamp((y - FOG_FAR) / (FOG_CLEAR - FOG_FAR), 0, 1); return t * t * (3 - 2 * t); }
 const rand = (a, b) => a + Math.random() * (b - a);
 const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
 const dist2 = (ax, ay, bx, by) => { const dx = ax - bx, dy = ay - by; return dx * dx + dy * dy; };
@@ -371,12 +418,29 @@ const WEAPONS = {
   rocket:     { name: 'Rocket Launcher', rate: 0.5, dmg: 28, speed: 480,  pellets: 1, spread: 0.04, life: 1.8,  pierce: 0, radius: 5,   color: '#ff4d5e', explode: 60, len: 10 },
 };
 // Rarity tiers: scale gate magnitudes and weapon damage
+// width/len/glow are bullet visuals only (thicker, longer, brighter rarity-coloured glow)
 const RARITY = [
-  { name: 'Common',    color: '#b8c4d6', mult: 1 },
-  { name: 'Rare',      color: '#4da3ff', mult: 1.3 },
-  { name: 'Epic',      color: '#c35bff', mult: 1.7 },
-  { name: 'Legendary', color: '#ffb52e', mult: 2.3 },
+  { name: 'Common',    color: '#b8c4d6', mult: 1,   width: 1,    len: 1,   glow: 0.3 },
+  { name: 'Rare',      color: '#4da3ff', mult: 1.3, width: 1.2,  len: 1.2, glow: 0.4 },
+  { name: 'Epic',      color: '#c35bff', mult: 1.7, width: 1.45, len: 1.4, glow: 0.5 },
+  { name: 'Legendary', color: '#ffb52e', mult: 2.3, width: 1.75, len: 1.8, glow: 0.65 },
 ];
+// Weapon rarity perks stack: Rare = +1 pierce (rockets: +25% blast), Epic = +20% fire rate, Legendary = weapon-specific perk below
+const LEGENDARY_PERKS = {
+  rifle:      'RICOCHET',        // bullets bounce once to a nearby enemy
+  machinegun: 'CRYO ROUNDS',     // hits slow enemies by 40%
+  shotgun:    'HEAVY BUCKSHOT',  // +2 pellets, triple knockback
+  sniper:     'RAILGUN',         // unlimited pierce, no damage falloff
+  rocket:     'CLUSTER BOMBS',   // each blast sets off 4 smaller blasts
+};
+const EPIC_ROF = 1.2;
+function weaponPerks(weapon, rar) {
+  const p = [];
+  if (rar >= 1) p.push(weapon === 'rocket' ? '+25% BLAST' : '+1 PIERCE');
+  if (rar >= 2) p.push('+20% ROF');
+  if (rar >= 3) p.push(LEGENDARY_PERKS[weapon]);
+  return p;
+}
 function rollRarity(wave, min = 0) {
   const leg = Math.min(0.22, 0.01 + wave * 0.008), epic = Math.min(0.35, 0.05 + wave * 0.015), rare = Math.min(0.45, 0.2 + wave * 0.015);
   const r = Math.random();
@@ -399,7 +463,6 @@ const POWERUPS = {
   rapid:  { name: 'RAPID FIRE', color: '#ffe23f', icon: 'R', dur: 8 },
   shield: { name: 'SHIELD',     color: '#3ff6ff', icon: 'S', dur: 6 },
   freeze: { name: 'FREEZE',     color: '#9fd8ff', icon: 'F', dur: 6 },
-  magnet: { name: 'MAGNET',     color: '#ff5cf0', icon: 'M', dur: 10 },
   nuke:   { name: 'NUKE',       color: '#ff4a3d', icon: 'N', dur: 0 },
 };
 const CAT_COLOR = { army: '#3dff9a', stat: '#4da3ff', special: '#ff5cf0', weapon: '#ffb52e' };
@@ -434,23 +497,42 @@ function makeGateOption(g, excludeId, minR) {
   }
   return { type: GATE_TYPES[0], rar: 0, m: 1, label: '+5 SOLDIERS' };
 }
+// Achievements are saved across runs (game.save.ach). The first unlock ever pays `reward` Medals.
+// Lifetime checks add the saved totals (g.save.kills, g.save.runs) to the current run.
 const ACHIEVEMENTS = [
-  { id: 'first',  name: 'First Blood',    desc: 'Defeat your first enemy',       check: g => g.kills >= 1 },
-  { id: 'k100',   name: 'Centurion',      desc: 'Defeat 100 enemies',            check: g => g.kills >= 100 },
-  { id: 'k1000',  name: 'Exterminator',   desc: 'Defeat 1,000 enemies',          check: g => g.kills >= 1000 },
-  { id: 'army25', name: 'Platoon',        desc: 'Command 25 soldiers',           check: g => g.squad.total >= 25 },
-  { id: 'merge',  name: 'Strength in Numbers', desc: 'Merge 100 soldiers into a Champion', check: g => g.squad.total >= 100 },
-  { id: 'army1k', name: 'Regiment',       desc: 'Command 1,000 soldiers',        check: g => g.squad.total >= 1000 },
-  { id: 'army10k',name: 'Legion',         desc: 'Command 10,000 soldiers',       check: g => g.squad.total >= 10000 },
-  { id: 'army100k', name: 'God of War',   desc: 'Reach the 100,000 soldier limit', check: g => g.squad.total >= MAX_ARMY },
-  { id: 'boss1',  name: 'Giant Slayer',   desc: 'Defeat a boss',                 check: g => g.bossKills >= 1 },
-  { id: 'boss3',  name: 'Living Legend',  desc: 'Defeat 3 bosses',               check: g => g.bossKills >= 3 },
-  { id: 'combo50',name: 'Combo Master',   desc: 'Reach a 50-kill combo',         check: g => g.maxCombo >= 50 },
-  { id: 'wave10', name: 'Survivor',       desc: 'Reach wave 10',                 check: g => g.wave >= 10 },
-  { id: 'legend', name: 'Gold Standard',  desc: 'Equip a Legendary weapon',      check: g => g.stats.weaponRarity === 3 },
-  { id: 'rich',   name: 'War Chest',      desc: 'Collect 500 coins',             check: g => g.totalCoins >= 500 },
-  { id: 'boom',   name: 'Demolitionist',  desc: 'Detonate 10 explosive barrels', check: g => g.barrelsBlown >= 10 },
-  { id: 'crit',   name: 'Precision',      desc: 'Land 250 critical hits',        check: g => g.crits >= 250 },
+  { id: 'first',  name: 'First Blood',    desc: 'Defeat your first enemy',       reward: 5,   check: g => g.kills >= 1 },
+  { id: 'k100',   name: 'Centurion',      desc: 'Defeat 100 enemies',            reward: 10,  check: g => g.kills >= 100 },
+  { id: 'k1000',  name: 'Exterminator',   desc: 'Defeat 1,000 enemies',          reward: 40,  check: g => g.kills >= 1000 },
+  { id: 'army25', name: 'Platoon',        desc: 'Command 25 soldiers',           reward: 10,  check: g => g.squad.total >= 25 },
+  { id: 'merge',  name: 'Strength in Numbers', desc: 'Merge 100 soldiers into a Champion', reward: 20, check: g => g.squad.total >= 100 },
+  { id: 'army1k', name: 'Regiment',       desc: 'Command 1,000 soldiers',        reward: 50,  check: g => g.squad.total >= 1000 },
+  { id: 'army10k',name: 'Legion',         desc: 'Command 10,000 soldiers',       reward: 100, check: g => g.squad.total >= 10000 },
+  { id: 'army100k', name: 'God of War',   desc: 'Reach the 100,000 soldier limit', reward: 250, check: g => g.squad.total >= MAX_ARMY },
+  { id: 'boss1',  name: 'Giant Slayer',   desc: 'Defeat a boss',                 reward: 30,  check: g => g.bossKills >= 1 },
+  { id: 'boss3',  name: 'Living Legend',  desc: 'Defeat 3 bosses in one run',    reward: 80,  check: g => g.bossKills >= 3 },
+  { id: 'boss6',  name: 'Titan Breaker',  desc: 'Defeat 6 bosses in one run',    reward: 150, check: g => g.bossKills >= 6 },
+  { id: 'combo50',name: 'Combo Master',   desc: 'Reach a 50-kill combo',         reward: 25,  check: g => g.maxCombo >= 50 },
+  { id: 'wave10', name: 'Survivor',       desc: 'Reach wave 10',                 reward: 30,  check: g => g.wave >= 10 },
+  { id: 'wave25', name: 'Hardened',       desc: 'Reach wave 25',                 reward: 75,  check: g => g.wave >= 25 },
+  { id: 'wave40', name: 'Unbreakable',    desc: 'Reach wave 40',                 reward: 150, check: g => g.wave >= 40 },
+  { id: 'legend', name: 'Gold Standard',  desc: 'Equip a Legendary weapon',      reward: 30,  check: g => g.stats.weaponRarity === 3 },
+  { id: 'rich',   name: 'War Chest',      desc: 'Collect 500 coins',             reward: 15,  check: g => g.totalCoins >= 500 },
+  { id: 'boom',   name: 'Demolitionist',  desc: 'Detonate 10 explosive barrels', reward: 15,  check: g => g.barrelsBlown >= 10 },
+  { id: 'crit',   name: 'Precision',      desc: 'Land 250 critical hits',        reward: 20,  check: g => g.crits >= 250 },
+  { id: 'runs10', name: 'Veteran',        desc: 'Deploy 10 times',               reward: 25,  check: g => g.save.runs >= 10 },
+  { id: 'life10k',name: 'Warlord',        desc: 'Defeat 10,000 enemies across all runs', reward: 75, check: g => g.save.kills + g.kills >= 10000 },
+];
+
+// Permanent Medal-shop upgrades. Level L costs cost(L) Medals; apply(g, L) runs in Game.reset() after the base setup.
+const UPGRADES = [
+  { id: 'recruits', name: 'Reserves',      desc: '+1 starting soldier',          max: 10, cost: L => 20 + 15 * L,  apply: (g, L) => g.squad.add(L) },
+  { id: 'dmg',      name: 'Hollow Points', desc: '+5% damage',                   max: 10, cost: L => 30 + 20 * L,  apply: (g, L) => { g.stats.damage *= 1 + 0.05 * L; } },
+  { id: 'rate',     name: 'Drill Sergeant',desc: '+4% fire rate',                max: 10, cost: L => 30 + 20 * L,  apply: (g, L) => { g.stats.fireRate *= 1 + 0.04 * L; } },
+  { id: 'crit',     name: 'Marksmanship',  desc: '+2% crit chance',              max: 5,  cost: L => 40 + 30 * L,  apply: (g, L) => { g.stats.crit += 0.02 * L; } },
+  { id: 'armour',   name: 'Kevlar',        desc: '+5% damage reduction',         max: 4,  cost: L => 60 + 40 * L,  apply: (g, L) => { g.stats.armour += L / 3; } },
+  { id: 'regen',    name: 'Field Medic',   desc: '+40% soldier regen',           max: 5,  cost: L => 35 + 25 * L,  apply: (g, L) => { g.stats.regen *= 1 + 0.4 * L; } },
+  { id: 'kit',      name: 'Field Kit',     desc: 'Start with a Rare, then Epic, rifle', max: 2, cost: L => [150, 400][L], apply: (g, L) => { g.stats.weaponRarity = L; } },
+  { id: 'bounty',   name: 'Bounty Hunter', desc: '+10% Medals earned per run',   max: 5,  cost: L => 50 + 40 * L,  apply: () => {} },
 ];
 
 /* ---------------- 6. Entities ---------------- */
@@ -557,7 +639,7 @@ class Squad {
     const follow = Math.min(1, dt * (8 + g.stats.move * 2));
     // Fire-rate cap: excess fire rate is converted to damage to keep bullet counts sane
     const w = WEAPONS[g.stats.weapon];
-    let rate = w.rate * g.stats.fireRate * (g.power.rapid > 0 ? 2 : 1), bonus = 1;
+    let rate = w.rate * g.stats.fireRate * (g.power.rapid > 0 ? 2 : 1) * (g.stats.weaponRarity >= 2 ? EPIC_ROF : 1), bonus = 1;
     const cap = w.rate * 3;
     if (rate > cap) { bonus = rate / cap; rate = cap; }
     for (const s of this.soldiers) {
@@ -566,7 +648,7 @@ class Squad {
       s.bob += dt * (this.moving ? 14 : 3);
       if (s.flash > 0) s.flash -= dt;
       if (s.recoil > 0) s.recoil -= dt * 8;
-      if (s.hp < s.maxHp) s.hp = Math.min(s.maxHp, s.hp + dt * 1.5);   // slow regen
+      if (s.hp < s.maxHp) s.hp = Math.min(s.maxHp, s.hp + dt * 1.5 * g.stats.regen);   // slow regen
       if (s.wound > 0) s.wound = Math.max(0, s.wound - dt * 3);
       s.angle = Math.atan2(g.aim.y - s.y, g.aim.x - s.x);
     }
@@ -647,7 +729,7 @@ class Enemy {
     this.maxHp = this.hp = t.hp * g.diff.hp; this.speed = t.speed * g.diff.speed * rand(0.9, 1.1);
     this.dmg = t.dmg * g.diff.dmg; this.atkCd = t.atkCd; this.atk = 0; this.score = t.score; this.coins = t.coins;
     this.elite = !!t.elite; this.flash = 0; this.kx = 0; this.ky = 0; this.t = 0; this.seed = rand(0, TAU);
-    this.shootCd = rand(1, 2.5); this.chargeT = 0; this.chargeCd = rand(2, 4); this.dir = Math.PI / 2; this.dead = false;
+    this.shootCd = rand(1, 2.5); this.chargeT = 0; this.chargeCd = rand(2, 4); this.slow = 0; this.dir = Math.PI / 2; this.dead = false;
   }
   update(dt) {
     const g = this.g, sq = g.squad, ft = dt * (g.power.freeze > 0 ? 0.3 : 1);
@@ -674,7 +756,8 @@ class Enemy {
         g.addText(this.x, this.y - this.r - 10, '!', '#ff3b3b', 30); g.audio.warn();
       }
     }
-    if (this.y < -20) sp = Math.max(sp, 60);   // always enter the field
+    if (this.y < -20) sp = Math.max(sp, ENTRY_SPEED);   // always enter the field promptly
+    if (this.slow > 0) { this.slow -= dt; sp *= 0.6; }   // Cryo Rounds
     this.x += dx / d * sp * ft; this.y += dy / d * sp * ft;
     this.x += this.kx * dt; this.y += this.ky * dt;
     const kd = Math.exp(-8 * dt); this.kx *= kd; this.ky *= kd;
@@ -710,6 +793,7 @@ class Enemy {
     }
     ctx.fillStyle = body; circle(ctx, x, y, r); ctx.fill();
     ctx.fillStyle = 'rgba(0,0,0,0.28)'; circle(ctx, x - ca * r * 0.2, y - sa * r * 0.2, r * 0.65); ctx.fill();
+    if (this.slow > 0) { ctx.strokeStyle = 'rgba(159,216,255,0.85)'; ctx.lineWidth = 2.5; circle(ctx, x, y, r + 3); ctx.stroke(); }
     if (this.type === 'tank') { ctx.strokeStyle = '#2b2f6b'; ctx.lineWidth = 4; circle(ctx, x, y, r - 3); ctx.stroke(); }
     if (this.type === 'runner') {
       ctx.strokeStyle = hexA('#ffae3a', 0.5); ctx.lineWidth = 2;
@@ -733,7 +817,7 @@ class Boss {
     const T = BOSS_TYPES[(num - 1) % BOSS_TYPES.length];
     this.g = g; this.num = num; this.kind = (num - 1) % BOSS_TYPES.length;
     this.name = T.name; this.color = T.color; this.r = T.r; this.attacks = T.attacks;
-    this.maxHp = this.hp = Math.round(4000 * Math.pow(1.9, num - 1));
+    this.maxHp = this.hp = Math.round(Math.max(4000 * Math.pow(1.9, num - 1), g.estimateDps() * BOSS_MIN_SECONDS));
     this.x = g.W / 2; this.y = -150; this.homeY = 170; this.state = 'enter'; this.t = 0;
     this.atkTimer = 2.2; this.atkIdx = 0; this.flash = 0; this.dmgScale = 1 + (num - 1) * 0.45;
     this.spiral = 0; this.spiralAng = 0; this.spiralCd = 0; this.spit = 0; this.spitCd = 0;
@@ -901,6 +985,7 @@ class GatePair {
     g.audio.gate();
     const col = gt.type.weapon ? RARITY[gt.rar].color : CAT_COLOR[gt.type.cat];
     g.addText(g.squad.x, g.squad.y - g.squad.radius - 30, (shot ? 'GATE OPENED! ' : '') + gt.label, col, 26, 1.6);
+    if (gt.type.weapon && g.stats.weaponRarity === 3) g.addText(g.squad.x, g.squad.y - g.squad.radius - 70, '★ ' + LEGENDARY_PERKS[g.stats.weapon] + ' ★', RARITY[3].color, 22, 2);
     // Shatter both panels into particles
     for (let k = 0; k < 2; k++) {
       const x0 = k * g.W / 2, c = k === i ? col : '#667080';
@@ -927,8 +1012,11 @@ class GatePair {
       const mw = ctx.measureText(gt.label).width; if (mw > w * 0.88) { fs = Math.floor(fs * w * 0.88 / mw); ctx.font = `900 ${fs}px Segoe UI, sans-serif`; }
       ctx.fillStyle = '#ffffff'; ctx.shadowColor = cc; ctx.shadowBlur = 12;
       ctx.fillText(gt.label, x0 + w / 2, -H * 0.62); ctx.shadowBlur = 0;
-      ctx.font = '800 12px Segoe UI, sans-serif'; ctx.fillStyle = rc;
-      ctx.fillText(RARITY[gt.rar].name.toUpperCase() + (gt.type.weapon ? ' WEAPON' : ''), x0 + w / 2, -H * 0.3);
+      // Subtitle: rarity, plus the perks a weapon of that rarity brings
+      const sub = RARITY[gt.rar].name.toUpperCase() + (gt.type.weapon ? (gt.rar ? ' · ' + weaponPerks(gt.type.weapon, gt.rar).join(' · ') : ' WEAPON') : '');
+      let ss = 12; ctx.font = `800 ${ss}px Segoe UI, sans-serif`;
+      const sw = ctx.measureText(sub).width; if (sw > w * 0.92) { ss = Math.max(7, Math.floor(ss * w * 0.92 / sw)); ctx.font = `800 ${ss}px Segoe UI, sans-serif`; }
+      ctx.fillStyle = rc; ctx.fillText(sub, x0 + w / 2, -H * 0.3);
       // Shoot-to-open bar
       const bw = w * 0.6, bx = x0 + (w - bw) / 2, by = -10;
       ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.fillRect(bx, by, bw, 4);
@@ -966,7 +1054,8 @@ class Pickup {
     const sq = g.squad; this.t += dt; this.life -= dt;
     const dr = Math.exp(-3 * dt); this.vx *= dr; this.vy += (40 - this.vy) * Math.min(1, dt * 2.5);
     const d = Math.sqrt(dist2(this.x, this.y, sq.x, sq.y)) || 1;
-    const range = sq.radius + (this.kind === 'coin' ? (g.power.magnet > 0 ? 3000 : 110) : 45);
+    // Coins are vacuumed up from anywhere once no enemies are left
+    const range = sq.radius + (this.kind === 'coin' ? (g.vacuum ? 5000 : 110) : 45);
     if (d < range) { const pull = 520; this.x += (sq.x - this.x) / d * pull * dt; this.y += (sq.y - this.y) / d * pull * dt; }
     else { this.x += this.vx * dt; this.y += this.vy * dt; }
     if (d < sq.radius + 10) { this.dead = true; g.collect(this); }
@@ -990,6 +1079,23 @@ class Pickup {
       ctx.fillStyle = P.color; ctx.font = '900 15px Segoe UI, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.fillText(P.icon, x, y + 1); ctx.textBaseline = 'alphabetic';
     }
+  }
+}
+
+// Drifting mist clouds that make up the fog bank. Depth-sorted with the entities,
+// so enemies further back are hidden behind them until they walk out.
+class FogPuff {
+  constructor(W) {
+    // Biased toward the back: most clouds sit around and beyond the spawn line
+    const t = Math.pow(Math.random(), 0.55);   // skews toward 1 = back
+    this.x = rand(-200, W + 200); this.y = FOG_CLEAR - 40 - t * (FOG_CLEAR - 40 - (SPAWN_FAR - 450));
+    const back = 1 - fogAlpha(this.y);   // 0 near the clear edge, 1 deep in the fog
+    this.size = rand(120, 200) * (1 + back * 0.6); this.vx = rand(-14, 14) || 6;
+    this.a = 0.25 + 0.6 * back;   // denser further back
+  }
+  draw(ctx) {   // local units, origin on the ground
+    ctx.globalAlpha *= this.a;
+    drawGlow(ctx, 0, -this.size * 0.22, FOG_COLOR, this.size);
   }
 }
 
@@ -1031,7 +1137,7 @@ class Camera {
     return { x: this.camX + (sx - this.baseCx) / s, y: this.camY - this.f / s };
   }
   squash(z) { return Math.min(1, this.camH / z); }      // vertical squash of a ground circle at depth z
-  fade(z) { return clamp((2000 - z) / 550, 0.2, 1); }   // distance fog
+  fade(z) { return clamp((VIEW_DIST * 0.45 - z) / 1100, 0.2, 1); }   // distance fog (fully opaque until ~2000)
 }
 
 /* ---------------- 7. Game ---------------- */
@@ -1047,11 +1153,12 @@ class Game {
     this.grid = new Map();
     this.ui = {};
     ['hud', 'topBtns', 'hWave', 'hSoldiers', 'hWeapon', 'hWeaponR', 'hMods', 'hCoins', 'hScore', 'hKills', 'hLevel', 'hXp', 'combo', 'powers',
-     'bossBar', 'bossName', 'bossFill', 'banner', 'toasts', 'recruit', 'recruitCost', 'menu', 'pauseMenu', 'overMenu', 'overStats', 'bestTxt', 'btnMute']
+     'bossBar', 'bossName', 'bossFill', 'banner', 'toasts', 'recruit', 'recruitCost', 'menu', 'pauseMenu', 'overMenu', 'overStats', 'bestTxt', 'btnMute', 'shop', 'shopGrid', 'shopMedals', 'menuMedals', 'tabUp', 'tabAch']
       .forEach(id => this.ui[id] = document.getElementById(id));
     this.hc = {};
     this.best = 0; try { this.best = +localStorage.getItem('squadSurgeBest') || 0; } catch (e) {}
     this.ui.bestTxt.textContent = this.best ? `Best score: ${this.best.toLocaleString()}` : '';
+    this.loadSave(); this.shopTab = 'up';
     this.state = 'menu';
     this.resize();
     this.input = new Input(this.canvas, this);
@@ -1065,6 +1172,11 @@ class Game {
     btn('btnPause', () => this.togglePause());
     btn('btnMute', () => this.toggleMute());
     btn('recruit', () => this.recruit());
+    btn('btnShop1', () => this.openShop());
+    btn('btnShop2', () => this.openShop());
+    btn('btnShopBack', () => this.closeShop());
+    btn('tabUp', () => { this.shopTab = 'up'; this.renderShop(); });
+    btn('tabAch', () => { this.shopTab = 'ach'; this.renderShop(); });
     this.last = performance.now();
     requestAnimationFrame(t => this.loop(t));
   }
@@ -1081,7 +1193,7 @@ class Game {
     this.skyGrad.addColorStop(0, '#03020a'); this.skyGrad.addColorStop(0.65, '#170a2c'); this.skyGrad.addColorStop(1, '#4a1240');
     this.groundGrad = c.createLinearGradient(0, hz, 0, ch);
     this.groundGrad.addColorStop(0, '#140a26'); this.groundGrad.addColorStop(0.3, '#060c1a'); this.groundGrad.addColorStop(1, '#08142a');
-    this.fogGrad = c.createLinearGradient(0, hz, 0, hz + (ch - hz) * 0.32);
+    this.fogGrad = c.createLinearGradient(0, hz, 0, hz + (ch - hz) * FOG_FRAC);
     this.fogGrad.addColorStop(0, 'rgba(46,14,60,0.95)'); this.fogGrad.addColorStop(1, 'rgba(20,10,40,0)');
     this.vignette = c.createRadialGradient(cw / 2, ch / 2, Math.min(cw, ch) * 0.35, cw / 2, ch / 2, Math.max(cw, ch) * 0.75);
     this.vignette.addColorStop(0, 'rgba(0,0,0,0)'); this.vignette.addColorStop(1, 'rgba(0,0,0,0.6)');
@@ -1093,15 +1205,21 @@ class Game {
       bossKills: 0, bossCount: 0, barrelsBlown: 0, crits: 0, recruits: 0, gatesTaken: 0,
       time: 0, scroll: 0, shake: 0, hurtFlash: 0, whiteFlash: 0,
       phase: 'intermission', phaseTimer: 1.2, spawnQueue: [], spawnTimer: 0, spawnInterval: 1, barrelTimer: 6,
-      boss: null, gatePair: null, pendingBossReward: false, achTimer: 0,
+      boss: null, gatePair: null, pendingBossReward: false, achTimer: 0, newAch: 0, achMedals: 0,
     });
-    this.stats = { weapon: 'rifle', weaponRarity: 0, fireRate: 1, damage: 1, multishot: 1, spread: 0, crit: 0.05, armour: 0, move: 1 };
-    this.power = { rapid: 0, shield: 0, freeze: 0, magnet: 0 };
+    this.stats = { weapon: 'rifle', weaponRarity: 0, fireRate: 1, damage: 1, multishot: 1, spread: 0, crit: 0.05, armour: 0, move: 1, regen: 1 };
+    this.power = { rapid: 0, shield: 0, freeze: 0 };
+    this.vacuum = false;
     this.diff = { hp: 1, speed: 1, dmg: 1 };
     this.enemies = []; this.bullets = []; this.eBullets = []; this.pickups = []; this.barrels = []; this.hazards = []; this.texts = [];
     this.achieved = new Set();
     this.particles.clear();
+    this.fog = Array.from({ length: 36 }, () => new FogPuff(this.W));
     this.squad = new Squad(this); this.squad.add(5);
+    for (const u of UPGRADES) { const L = this.upLevel(u.id); if (L) u.apply(this, L); }   // permanent Medal-shop upgrades
+    this.stats.crit = Math.min(0.75, this.stats.crit);
+    // Reference point for adaptive enemy HP. Measured after upgrades so permanent upgrades keep their full value.
+    this.baseDps = Math.max(1, this.estimateDps());
     this.cam.follow(this.squad, this, 0, true);
     this.aim = { x: this.W / 2, y: 0 };
     this.hc = {};
@@ -1109,6 +1227,7 @@ class Game {
   start() {
     this.audio.init();
     this.reset();
+    this.save.runs++; this.writeSave();
     this.state = 'playing';
     ['menu', 'pauseMenu', 'overMenu'].forEach(id => this.ui[id].classList.add('hidden'));
     ['hud', 'topBtns', 'recruit'].forEach(id => this.ui[id].classList.remove('hidden'));
@@ -1120,6 +1239,7 @@ class Game {
   }
   toggleMute() { this.audio.muted = !this.audio.muted; this.ui.btnMute.textContent = this.audio.muted ? '🔇' : '🔊'; }
   onKey(k) {
+    if (this.shopOpen) { if (k === 'escape') this.closeShop(); return; }
     if (k === 'p' || k === 'escape') this.togglePause();
     else if (k === 'm') this.toggleMute();
     else if (k === 'r' && (this.state === 'paused' || this.state === 'over')) this.start();
@@ -1131,8 +1251,11 @@ class Game {
     this.state = 'over'; this.audio.gameOver();
     const newBest = this.score > this.best;
     if (newBest) { this.best = this.score; try { localStorage.setItem('squadSurgeBest', this.best); } catch (e) {} }
-    const rows = [['Wave reached', this.wave], ['Score', this.score.toLocaleString() + (newBest ? ' ★ NEW BEST' : '')], ['Best', this.best.toLocaleString()],
-      ['Kills', this.kills], ['Bosses defeated', this.bossKills], ['Max combo', this.maxCombo], ['Coins collected', this.totalCoins], ['Achievements', `${this.achieved.size}/${ACHIEVEMENTS.length}`]];
+    const medals = this.medalsEarned();
+    this.save.medals += medals; this.save.kills += this.kills; this.writeSave();
+    this.ui.menuMedals.textContent = `🎖 ${this.save.medals} MEDALS`;
+    const rows = [['Medals earned', `🎖 +${medals + this.achMedals}` + (this.newAch ? ` (incl. ${this.newAch} new achievement${this.newAch > 1 ? 's' : ''})` : '')], ['Wave reached', this.wave], ['Score', this.score.toLocaleString() + (newBest ? ' ★ NEW BEST' : '')], ['Best', this.best.toLocaleString()],
+      ['Kills', this.kills], ['Bosses defeated', this.bossKills], ['Max combo', this.maxCombo], ['Coins collected', this.totalCoins], ['Achievements', `${this.save.ach.length}/${ACHIEVEMENTS.length}`]];
     this.ui.overStats.innerHTML = '';
     for (const [a, b] of rows) { const s1 = document.createElement('span'), s2 = document.createElement('span'); s1.textContent = a; s2.textContent = b; this.ui.overStats.append(s1, s2); }
     this.ui.overMenu.classList.remove('hidden'); this.ui.bossBar.classList.add('hidden');
@@ -1141,7 +1264,9 @@ class Game {
   /* ----- Wave director ----- */
   startWave() {
     this.wave++; const n = this.wave;
-    this.diff = { hp: 1 + (n - 1) * 0.22 + Math.pow(n, 1.5) * 0.015, speed: 1 + Math.min(0.6, (n - 1) * 0.025), dmg: 1 + (n - 1) * 0.07 };
+    const curve = (1 + 0.12 * (n - 1)) * Math.pow(HP_GROWTH, n - 1);
+    const power = Math.pow(Math.max(1, this.estimateDps() / this.baseDps), ADAPT_EXP);
+    this.diff = { hp: Math.max(curve, power), speed: 1 + Math.min(0.6, (n - 1) * 0.025), dmg: Math.pow(DMG_GROWTH, n - 1) };
     const bossWave = n % 5 === 0;
     let count = Math.floor(10 + n * 4 + Math.pow(n, 1.25));
     if (bossWave) count = Math.floor(count * 0.5);
@@ -1189,7 +1314,7 @@ class Game {
   }
   spawnEnemy(type, x, y) {
     if (x === undefined) x = rand(30, this.W - 30);
-    if (y === undefined) y = rand(-260, -30);
+    if (y === undefined) y = rand(SPAWN_FAR, SPAWN_NEAR);
     this.enemies.push(new Enemy(this, type, x, y));
   }
 
@@ -1197,11 +1322,11 @@ class Game {
   // Expected squad damage per second (mirrors Squad.update + fire), excluding temporary power-ups
   estimateDps() {
     const st = this.stats, w = WEAPONS[st.weapon];
-    let rate = w.rate * st.fireRate, bonus = 1;
+    let rate = w.rate * st.fireRate * (st.weaponRarity >= 2 ? EPIC_ROF : 1), bonus = 1;
     const cap = w.rate * 3;
     if (rate > cap) { bonus = rate / cap; rate = cap; }
     // Wide spread-shot pellets mostly miss a focused target, so they aren't counted
-    const shots = w.pellets * (st.multishot > 1 ? 3 : 1);
+    const shots = (w.pellets + (st.weaponRarity === 3 && st.weapon === 'shotgun' ? 2 : 0)) * (st.multishot > 1 ? 3 : 1);
     const dmg = w.dmg * RARITY[st.weaponRarity].mult * st.damage * bonus * (1 + st.crit * 1.2);
     return this.squad.eff * rate * shots * dmg;
   }
@@ -1215,16 +1340,23 @@ class Game {
     const offs = [0];
     if (st.multishot > 1) offs.push(-0.13, 0.13);
     for (let l = 1; l <= st.spread; l++) offs.push(-0.22 - 0.2 * l, 0.22 + 0.2 * l);
-    const ex = w.explode * (1 + st.weaponRarity * 0.15) * (1 + (wm - 1) * 0.15), r = w.radius * (1 + (wm - 1) * 0.7);
+    // Rarity perks (see LEGENDARY_PERKS / weaponPerks) and visual tier
+    const rar = st.weaponRarity, R = RARITY[rar], leg = rar === 3, wpn = st.weapon;
+    const pellets = w.pellets + (leg && wpn === 'shotgun' ? 2 : 0);
+    const pierce = leg && wpn === 'sniper' ? 999 : w.pierce + (rar >= 1 && wpn !== 'rocket' ? 1 : 0);
+    const ex = w.explode * (1 + rar * 0.15) * (rar >= 1 ? 1.25 : 1) * (1 + (wm - 1) * 0.15), r = w.radius * (1 + (wm - 1) * 0.7);
+    const glowCol = rar ? R.color : w.color, vw = wm * R.width, len = w.len * R.len;
     for (const o of offs) {
-      for (let p = 0; p < w.pellets; p++) {
-        if (this.bullets.length >= 1600) return;
-        const pa = w.pellets > 1 ? (p / (w.pellets - 1) - 0.5) * w.spread + rand(-0.05, 0.05) : rand(-0.5, 0.5) * w.spread;
+      for (let p = 0; p < pellets; p++) {
+        if (this.bullets.length >= MAX_BULLETS) return;
+        const pa = pellets > 1 ? (p / (pellets - 1) - 0.5) * w.spread + rand(-0.05, 0.05) : rand(-0.5, 0.5) * w.spread;
         const ang = a + o + pa, spd = w.speed * rand(0.95, 1.05);
-        this.bullets.push({ x: mx, y: my, vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd, dmg, life: w.life * rand(0.9, 1.1), pierce: w.pierce, hits: null, r, wm, explode: ex, len: w.len, color: w.color });
+        this.bullets.push({ x: mx, y: my, vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd, dmg, life: w.life * BULLET_RANGE * rand(0.9, 1.1), pierce, hits: null, r, wm, explode: ex, len, color: w.color,
+          rar, vw, gc: glowCol, ga: R.glow,
+          bounce: leg && wpn === 'rifle' ? 1 : 0, cryo: leg && wpn === 'machinegun', kb: leg && wpn === 'shotgun' ? 3 : 1, rail: leg && wpn === 'sniper', cluster: leg && wpn === 'rocket' });
       }
     }
-    if (Math.random() < 0.3) this.particles.cone(mx, my, a, 0.4, w.color, 2, 160, 0.12, 3);
+    if (Math.random() < 0.3) this.particles.cone(mx, my, a, 0.4, glowCol, 2, 160, 0.12, 3);
     this.audio.shoot(st.weapon);
   }
   enemyShot(x, y, a, speed, r, color, dmg, homing = false) {
@@ -1271,7 +1403,7 @@ class Game {
     this.particles.ring(b.x, b.y, b.color, 400, 1, 10); this.particles.ring(b.x, b.y, '#ffffff', 260, 0.7, 6);
     this.shake = 25; this.whiteFlash = 0.5; this.audio.explosion(true); this.audio.boss();
     for (let i = 0; i < 25; i++) this.pickups.push(new Pickup(b.x + rand(-40, 40), b.y + rand(-40, 40), 'coin', 4 + b.num * 2));
-    this.pickups.push(new Pickup(b.x, b.y, pick(['rapid', 'shield', 'magnet']), 0));
+    this.pickups.push(new Pickup(b.x, b.y, pick(['rapid', 'shield']), 0));
     const bonus = 10 * b.num;
     this.squad.add(bonus); this.squad.healAll();
     this.eBullets.length = 0; this.hazards.length = 0;
@@ -1304,11 +1436,13 @@ class Game {
     }
   }
   // Area damage: rockets, barrels, nukes. Barrels caught in the blast chain-react.
+  // small: true = rocket-sized effects; 'mini' = Cluster Bomb sub-blast (a few sparks only, no ring or sound)
   explode(x, y, radius, dmg, hurtSoldiers, small) {
     for (const e of this.enemies) {
       if (e.dead) continue;
-      const d = Math.sqrt(dist2(x, y, e.x, e.y));
-      if (d < radius + e.r) {
+      const rr = radius + e.r, d2 = dist2(x, y, e.x, e.y);
+      if (d2 < rr * rr) {
+        const d = Math.sqrt(d2);
         const crit = Math.random() < this.stats.crit;
         this.damageEnemy(e, dmg * (1 - 0.5 * Math.min(1, d / radius)) * (crit ? 2.2 : 1), crit, true);
         const k = e.elite ? 60 : 220; e.kx += (e.x - x) / (d || 1) * k; e.ky += (e.y - y) / (d || 1) * k;
@@ -1317,6 +1451,7 @@ class Game {
     if (this.boss && this.boss.state !== 'enter' && dist2(x, y, this.boss.x, this.boss.y) < (radius + this.boss.r) ** 2) this.damageBoss(dmg * 0.8, false, x, y);
     for (const b of this.barrels) if (!b.dead && b.fuse <= 0 && dist2(x, y, b.x, b.y) < (radius + b.r) ** 2) b.fuse = 0.12;
     if (hurtSoldiers) for (const s of this.squad.soldiers) if (dist2(x, y, s.x, s.y) < (radius + s.rad) ** 2) this.damageSoldier(s, 15, true);
+    if (small === 'mini') { this.particles.burst(x, y, '#ffb52e', 3, 200, 0.35, 4); return; }
     if (small) {
       this.particles.burst(x, y, '#ff9d3c', 10, 240, 0.4, 4);
       this.particles.ring(x, y, '#ff7b2e', radius, 0.3, 3);
@@ -1418,6 +1553,34 @@ class Game {
       }
     }
   }
+  // Rocket blast from a player bullet; Legendary rockets (Cluster Bombs) add 4 smaller blasts around it
+  bulletBlast(b) {
+    this.explode(b.x, b.y, b.explode, b.dmg * 0.7, false, true);
+    if (!b.cluster) return;
+    const a0 = Math.random() * TAU;
+    for (let k = 0; k < 4; k++) {
+      const a = a0 + k * TAU / 4, d = b.explode * 0.9;
+      this.explode(b.x + Math.cos(a) * d, b.y + Math.sin(a) * d, b.explode * 0.55, b.dmg * 0.35, false, 'mini');
+    }
+  }
+  // Legendary rifle (Ricochet): redirect the bullet toward the nearest other enemy within ~200 units
+  ricochet(b, from) {
+    const cx = Math.floor(from.x / CELL), cy = Math.floor(from.y / CELL);
+    let best = null, bd = 200 * 200;
+    for (let ox = -3; ox <= 3; ox++) for (let oy = -3; oy <= 3; oy++) {
+      const arr = this.grid.get(this.key(cx + ox, cy + oy)); if (!arr) continue;
+      for (const e of arr) {
+        if (e === from || e.dead || (b.hits && b.hits.includes(e))) continue;
+        const d = dist2(from.x, from.y, e.x, e.y); if (d < bd) { bd = d; best = e; }
+      }
+    }
+    if (!best) return false;
+    const sp = Math.hypot(b.vx, b.vy) || 1, a = Math.atan2(best.y - b.y, best.x - b.x);
+    b.vx = Math.cos(a) * sp; b.vy = Math.sin(a) * sp;
+    b.bounce--; (b.hits || (b.hits = [])).push(from); b.dmg *= 0.8; b.life = Math.max(b.life, 0.4);
+    this.particles.burst(b.x, b.y, RARITY[3].color, 3, 160, 0.25, 3);
+    return true;
+  }
   // Returns true if bullet should be consumed
   bulletHits(b) {
     if (this.gatePair && this.gatePair.hitTest(b)) return true;
@@ -1425,7 +1588,7 @@ class Game {
       if (!br.dead && dist2(b.x, b.y, br.x, br.y) < (br.r + b.r) ** 2) {
         br.hp -= b.dmg; br.flash = 0.08;
         if (br.hp <= 0) this.detonateBarrel(br);
-        if (b.explode) this.explode(b.x, b.y, b.explode, b.dmg * 0.7, false, true);
+        if (b.explode) this.bulletBlast(b);
         return true;
       }
     }
@@ -1434,7 +1597,7 @@ class Game {
       const crit = Math.random() < this.stats.crit;
       this.damageBoss(b.dmg * (crit ? 2.2 : 1), crit, b.x, b.y);
       this.particles.burst(b.x, b.y, bo.color, 2, 140, 0.25, 3);
-      if (b.explode) this.explode(b.x, b.y, b.explode, b.dmg * 0.7, false, true);
+      if (b.explode) this.bulletBlast(b);
       return true;
     }
     const cx = Math.floor(b.x / CELL), cy = Math.floor(b.y / CELL);
@@ -1446,11 +1609,13 @@ class Game {
         if (dist2(b.x, b.y, e.x, e.y) < r * r) {
           const crit = Math.random() < this.stats.crit;
           this.damageEnemy(e, b.dmg * (crit ? 2.2 : 1), crit, false);
-          const sp = Math.hypot(b.vx, b.vy) || 1, kb = (e.elite || e.type === 'tank') ? 12 : 45;
+          const sp = Math.hypot(b.vx, b.vy) || 1, kb = ((e.elite || e.type === 'tank') ? 12 : 45) * b.kb;
           e.kx += b.vx / sp * kb; e.ky += b.vy / sp * kb;
+          if (b.cryo) e.slow = 1.2;
           this.particles.burst(b.x, b.y, e.color, 2, 140, 0.25, 3);
-          if (b.explode) { this.explode(b.x, b.y, b.explode, b.dmg * 0.7, false, true); return true; }
-          if (b.pierce > 0) { b.pierce--; (b.hits || (b.hits = [])).push(e); b.dmg *= 0.85; }
+          if (b.explode) { this.bulletBlast(b); return true; }
+          if (b.pierce > 0) { b.pierce--; (b.hits || (b.hits = [])).push(e); if (!b.rail) b.dmg *= 0.85; }
+          else if (b.bounce > 0 && this.ricochet(b, e)) return false;
           else return true;
         }
       }
@@ -1463,12 +1628,13 @@ class Game {
       const b = bl[i];
       b.x += b.vx * dt; b.y += b.vy * dt; b.life -= dt;
       let remove;
-      if (b.life <= 0 || b.x < -40 || b.x > this.W + 40 || b.y < -80 || b.y > this.H + 40) {
+      if (b.life <= 0 || b.x < -40 || b.x > this.W + 40 || b.y < SPAWN_FAR - 400 || b.y > this.H + 40) {
         remove = true;
-        if (b.explode && b.life <= 0) this.explode(b.x, b.y, b.explode, b.dmg * 0.7, false, true);
+        if (b.explode && b.life <= 0) this.bulletBlast(b);
       } else {
         remove = this.bulletHits(b);
         if (b.explode && Math.random() < 0.5) this.particles.burst(b.x, b.y, '#ff9d3c', 1, 40, 0.3, 3);
+        if (b.rar === 3 && Math.random() < 0.1 && this.particles.list.length < 600) this.particles.burst(b.x, b.y, RARITY[3].color, 1, 30, 0.35, 3);
       }
       if (remove) { bl[i] = bl[bl.length - 1]; bl.pop(); }
     }
@@ -1514,7 +1680,7 @@ class Game {
       // Auto-aim: nearest visible enemy (or boss) to the squad
       let best = null, bd = Infinity;
       for (const e of this.enemies) {
-        if (e.dead || e.y < -10) continue;
+        if (e.dead) continue;   // includes enemies still approaching beyond the field edge
         const d = dist2(e.x, e.y, this.squad.x, this.squad.y); if (d < bd) { bd = d; best = e; }
       }
       if (this.boss && this.boss.state !== 'enter') { const d = dist2(this.boss.x, this.boss.y, this.squad.x, this.squad.y) * 1.5; if (d < bd) best = this.boss; }
@@ -1548,7 +1714,9 @@ class Game {
     this.updateBullets(dt);
     this.updateHazards(dt);
     for (const b of this.barrels) b.update(dt, this);
+    this.vacuum = !this.boss && !this.enemies.some(e => !e.dead);
     for (const p of this.pickups) p.update(dt, this);
+    for (const f of this.fog) { f.x += f.vx * dt; if (f.x < -260) f.x += this.W + 520; else if (f.x > this.W + 260) f.x -= this.W + 520; }
     this.particles.update(dt);
     for (const t of this.texts) { t.life -= dt; t.h += t.vy * dt; t.vy *= Math.exp(-2 * dt); }
 
@@ -1565,15 +1733,63 @@ class Game {
     this.updateHUD();
   }
 
+  /* ----- Meta progression: save, Medals, shop ----- */
+  loadSave() {
+    let d = null; try { d = JSON.parse(localStorage.getItem('squadSurgeSave')); } catch (e) {}
+    this.save = Object.assign({ medals: 0, up: {}, ach: [], kills: 0, runs: 0 }, d || {});
+    this.ui.menuMedals.textContent = `🎖 ${this.save.medals} MEDALS`;
+  }
+  writeSave() { try { localStorage.setItem('squadSurgeSave', JSON.stringify(this.save)); } catch (e) {} }
+  upLevel(id) { return this.save.up[id] || 0; }
+  // Medals for a finished run (achievement rewards are paid separately, the moment they unlock)
+  medalsEarned() {
+    const base = Math.floor(this.totalCoins / 10) + this.wave * 3 + this.bossKills * 15;
+    return Math.round(base * (1 + 0.1 * this.upLevel('bounty')));
+  }
+  openShop() { this.shopOpen = true; this.ui.shop.classList.remove('hidden'); this.renderShop(); }
+  closeShop() { this.shopOpen = false; this.ui.shop.classList.add('hidden'); }
+  buyUpgrade(u) {
+    const L = this.upLevel(u.id); if (L >= u.max) return;
+    const c = u.cost(L); if (this.save.medals < c) return;
+    this.save.medals -= c; this.save.up[u.id] = L + 1; this.writeSave();
+    this.audio.init(); this.audio.levelUp(); this.renderShop();
+  }
+  renderShop() {
+    const ui = this.ui, sv = this.save, el = (tag, cls, txt) => { const e = document.createElement(tag); if (cls) e.className = cls; if (txt !== undefined) e.textContent = txt; return e; };
+    ui.shopMedals.textContent = ui.menuMedals.textContent = `🎖 ${sv.medals} MEDALS`;
+    ui.tabUp.classList.toggle('on', this.shopTab === 'up'); ui.tabAch.classList.toggle('on', this.shopTab === 'ach');
+    ui.shopGrid.innerHTML = '';
+    if (this.shopTab === 'up') {
+      for (const u of UPGRADES) {
+        const L = this.upLevel(u.id), c = el('div', 'card');
+        c.append(el('div', 'n', u.name), el('div', 'd', u.desc), el('div', 'pips', '◆'.repeat(L) + '◇'.repeat(u.max - L)));
+        const b = el('button', '', L >= u.max ? 'MAXED' : `BUY · 🎖 ${u.cost(L)}`);
+        b.disabled = L >= u.max || sv.medals < u.cost(L);
+        b.addEventListener('click', e => { e.stopPropagation(); this.buyUpgrade(u); });
+        c.append(b); ui.shopGrid.append(c);
+      }
+    } else {
+      for (const a of ACHIEVEMENTS) {
+        const got = sv.ach.includes(a.id), c = el('div', 'card ' + (got ? 'got' : 'locked'));
+        c.append(el('div', 'n', (got ? '🏆 ' : '🔒 ') + a.name), el('div', 'd', a.desc), el('div', 'rw', got ? 'UNLOCKED' : `🎖 ${a.reward}`));
+        ui.shopGrid.append(c);
+      }
+    }
+  }
+
   /* ----- Achievements / UI ----- */
   checkAchievements() {
     for (const a of ACHIEVEMENTS) {
       if (!this.achieved.has(a.id) && a.check(this)) {
-        this.achieved.add(a.id); this.audio.achievement();
+        this.achieved.add(a.id);
+        if (this.save.ach.includes(a.id)) continue;   // already unlocked in an earlier run
+        this.save.ach.push(a.id); this.newAch++; this.achMedals += a.reward;
+        this.save.medals += a.reward; this.writeSave();
+        this.audio.achievement();
         const d = document.createElement('div'); d.className = 'toast';
         const t1 = document.createElement('div'); t1.className = 'tt'; t1.textContent = '🏆 ACHIEVEMENT UNLOCKED';
         const t2 = document.createElement('div'); t2.className = 'tn'; t2.textContent = a.name;
-        const t3 = document.createElement('div'); t3.className = 'td'; t3.textContent = a.desc;
+        const t3 = document.createElement('div'); t3.className = 'td'; t3.textContent = `${a.desc} · 🎖 +${a.reward}`;
         d.append(t1, t2, t3); this.ui.toasts.appendChild(d);
         setTimeout(() => d.remove(), 4000);
       }
@@ -1593,7 +1809,7 @@ class Game {
     this.setText('hWeapon', WEAPONS[st.weapon].name);
     this.setText('hWeaponR', R.name + ' weapon');
     if (this.hc.wc !== R.color) { this.hc.wc = R.color; this.ui.hWeapon.style.color = R.color; this.ui.hWeapon.style.textShadow = `0 0 10px ${R.color}`; }
-    const mods = [];
+    const mods = weaponPerks(st.weapon, st.weaponRarity);
     if (st.multishot > 1) mods.push('TRIPLE'); if (st.spread) mods.push('SPREAD ' + st.spread);
     mods.push(`DMG ${Math.round(st.damage * 100)}%`, `ROF ${Math.round(st.fireRate * 100)}%`, `CRIT ${Math.round(st.crit * 100)}%`);
     if (st.armour > 0) mods.push(`ARM ${Math.round((1 - Math.pow(0.85, st.armour)) * 100)}%`);
@@ -1637,16 +1853,24 @@ class Game {
     for (const s of this.stars) { ctx.globalAlpha = s.a * (0.6 + 0.4 * Math.sin(this.time * 2 + s.p)); ctx.fillRect(s.x * cw, s.y * hz * 0.95, s.s, s.s); }
     ctx.globalAlpha = 1;
     ctx.fillStyle = this.groundGrad; ctx.fillRect(0, hz, cw, ch - hz);
-    const yFar = cam.camY - 4000, yNear = cam.camY - 30, far = cam.camY - 2600;
+    // View distance. Far detail uses coarser spacing (LOD) so on-screen line density, and cost, stay roughly constant.
+    const yFar = cam.camY - VIEW_DIST - 1500, yNear = cam.camY - 30, far = cam.camY - VIEW_DIST, mid = cam.camY - 4000;
     // Road surface
     ctx.fillStyle = '#0b1830'; ctx.beginPath();
     cam.p(0, yFar); ctx.moveTo(cam.X, cam.Y); cam.p(W, yFar); ctx.lineTo(cam.X, cam.Y);
     cam.p(W, yNear); ctx.lineTo(cam.X, cam.Y); cam.p(0, yNear); ctx.lineTo(cam.X, cam.Y); ctx.fill();
     // Grid scrolls toward the camera: the squad is advancing
     ctx.strokeStyle = 'rgba(60,130,255,0.14)'; ctx.lineWidth = 1; ctx.beginPath();
-    for (let x = -640; x <= W + 640; x += 64) this.pline(ctx, x, yFar, 0, x, yNear, 0);
-    for (let y = Math.floor(yNear / 60) * 60 + this.scroll % 60; y > far; y -= 60) this.pline(ctx, -640, y, 0, W + 640, y, 0);
-    ctx.stroke();
+    for (let x = -640; x <= W + 640; x += 64) this.pline(ctx, x, far, 0, x, yNear, 0);
+    // Cross lines in depth bands: spacing doubles and alpha drops with distance (each coarser set is a subset of the finer one, so lines never pop)
+    const bands = [[cam.camY - 2600, 60, 0.14], [mid, 120, 0.1], [far, 240, 0.06]];
+    let from = yNear;
+    for (const [to, step, alpha] of bands) {
+      ctx.strokeStyle = `rgba(60,130,255,${alpha})`; ctx.beginPath();
+      let y = Math.floor(from / step) * step + this.scroll % step; if (y > from) y -= step;
+      for (; y > to; y -= step) this.pline(ctx, -640, y, 0, W + 640, y, 0);
+      ctx.stroke(); from = to;
+    }
     // Darken off-road ground
     ctx.fillStyle = 'rgba(0,0,0,0.4)';
     for (const [a, b] of [[-3000, 0], [W, W + 3000]]) {
@@ -1655,11 +1879,13 @@ class Game {
     }
     // Centre lane dashes
     ctx.fillStyle = 'rgba(120,200,255,0.12)';
-    for (let y = Math.floor(yNear / 90) * 90 + this.scroll % 90; y > far; y -= 90) {
-      ctx.beginPath(); cam.p(W / 2 - 3, y); ctx.moveTo(cam.X, cam.Y); cam.p(W / 2 + 3, y); ctx.lineTo(cam.X, cam.Y);
-      cam.p(W / 2 + 3, y - 40); ctx.lineTo(cam.X, cam.Y); cam.p(W / 2 - 3, y - 40); ctx.lineTo(cam.X, cam.Y); ctx.fill();
+    ctx.beginPath();   // one fill for all dashes; beyond `mid` they would be sub-pixel
+    for (let y = Math.floor(yNear / 90) * 90 + this.scroll % 90; y > mid; y -= 90) {
+      cam.p(W / 2 - 3, y); ctx.moveTo(cam.X, cam.Y); cam.p(W / 2 + 3, y); ctx.lineTo(cam.X, cam.Y);
+      cam.p(W / 2 + 3, y - 40); ctx.lineTo(cam.X, cam.Y); cam.p(W / 2 - 3, y - 40); ctx.lineTo(cam.X, cam.Y); ctx.closePath();
     }
-    ctx.fillStyle = this.fogGrad; ctx.fillRect(0, hz, cw, (ch - hz) * 0.32);
+    ctx.fill();
+    ctx.fillStyle = this.fogGrad; ctx.fillRect(0, hz, cw, (ch - hz) * FOG_FRAC);
     // Neon rails, posts and pylons (additive glow)
     ctx.globalCompositeOperation = 'lighter';
     for (const x of [0, W]) {
@@ -1667,11 +1893,11 @@ class Game {
       ctx.strokeStyle = 'rgba(63,246,255,0.75)'; ctx.beginPath(); this.pline(ctx, x, yFar, 12, x, yNear, 12); ctx.stroke();
       ctx.strokeStyle = 'rgba(63,246,255,0.3)'; ctx.beginPath(); this.pline(ctx, x, yFar, 0, x, yNear, 0); ctx.stroke();
       ctx.strokeStyle = 'rgba(63,246,255,0.45)'; ctx.beginPath();
-      for (let y = Math.floor(yNear / 120) * 120 + this.scroll % 120; y > far; y -= 120) this.pline(ctx, x, y, 0, x, y, 14);
+      for (let y = Math.floor(yNear / 120) * 120 + this.scroll % 120; y > mid; y -= 120) this.pline(ctx, x, y, 0, x, y, 14);
       ctx.stroke();
     }
     for (const x of [-120, W + 120]) {
-      for (let y = Math.floor(yNear / 400) * 400 + this.scroll % 400; y > cam.camY - 3400; y -= 400) {
+      for (let y = Math.floor(yNear / 400) * 400 + this.scroll % 400; y > far; y -= 400) {
         cam.p(x, y, 0); if (cam.Z < 60) continue;
         const X0 = cam.X, Y0 = cam.Y, S = cam.S; cam.p(x, y, 170);
         ctx.strokeStyle = 'rgba(255,60,140,0.4)'; ctx.lineWidth = Math.max(1, 3 * S);
@@ -1680,6 +1906,14 @@ class Game {
       }
     }
     ctx.globalCompositeOperation = 'source-over';
+    // Ground fog bank: clear at FOG_CLEAR, thickest around the spawn line, thinning toward the horizon so the far road still shows
+    cam.p(0, FOG_CLEAR); const yClear = cam.Y; cam.p(0, SPAWN_FAR); const ySpawn = cam.Y;
+    if (yClear > hz + 1) {
+      const fg = ctx.createLinearGradient(0, hz, 0, yClear), mid = clamp((ySpawn - hz) / (yClear - hz), 0.05, 0.95);
+      fg.addColorStop(0, 'rgba(40,26,70,0.96)'); fg.addColorStop(mid * 0.5, 'rgba(44,28,76,0.93)');
+      fg.addColorStop(mid, 'rgba(46,30,80,0.82)'); fg.addColorStop(mid + (1 - mid) * 0.5, 'rgba(46,30,80,0.35)'); fg.addColorStop(1, 'rgba(46,30,80,0)');
+      ctx.fillStyle = fg; ctx.fillRect(0, hz, cw, yClear - hz);
+    }
     ctx.fillStyle = 'rgba(255,90,160,0.35)'; ctx.fillRect(0, hz - 1, cw, 2);   // horizon line
   }
   // Ground shadows anchor every standing figure to the floor
@@ -1692,10 +1926,18 @@ class Game {
     };
     for (const s of this.squad.soldiers) add(s.x, s.y, s.rad);
     for (const e of this.enemies) add(e.x, e.y, e.r);
-    for (const b of this.barrels) add(b.x, b.y, 14);
-    for (const p of this.pickups) add(p.x, p.y, 7);
-    if (this.boss) add(this.boss.x, this.boss.y, this.boss.r);
+    // Shadows of things inside the fog bank fade with them (drawn individually, after the main batch)
+    const fogged = [];
+    const addF = (x, y, r) => { const f = fogAlpha(y); if (f > 0.99) add(x, y, r); else if (f > 0.01) fogged.push(x, y, r, f); };
+    for (const e of this.enemies) addF(e.x, e.y, e.r);
+    for (const b of this.barrels) addF(b.x, b.y, 14);
+    for (const p of this.pickups) addF(p.x, p.y, 7);
+    if (this.boss) addF(this.boss.x, this.boss.y, this.boss.r);
     ctx.fill();
+    for (let i = 0; i < fogged.length; i += 4) {
+      ctx.globalAlpha = fogged[i + 3]; ctx.beginPath(); add(fogged[i], fogged[i + 1], fogged[i + 2]); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
   }
   // Painter's algorithm: draw everything standing on the ground from far to near
   drawEntities(ctx) {
@@ -1706,17 +1948,21 @@ class Game {
     for (const p of this.pickups) L.push(p);
     if (this.boss) L.push(this.boss);
     if (this.gatePair) L.push(this.gatePair);
+    for (const f of this.fog) L.push(f);
     for (const o of L) o._d = o instanceof GatePair ? o.y + o.h / 2 : o.y;
     L.sort((a, b) => a._d - b._d);
     cam.p(sq.x, sq.y, 10); const qX = cam.X, qY = cam.Y;
     for (const o of L) {
       if (o instanceof GatePair) {
         cam.p(0, o._d, 0); if (cam.Z < 40) continue;
-        this.local(cam.S, cam.X, cam.Y); o.draw(ctx); continue;
+        ctx.globalAlpha = 1; this.local(cam.S, cam.X, cam.Y); o.draw(ctx); continue;
       }
+      // Anything except soldiers and mist fades out inside the fog bank
+      const fa = (o instanceof Soldier || o instanceof FogPuff) ? 1 : fogAlpha(o.y);
+      if (fa < 0.01) continue;
       cam.p(o.x, o.y, 0); if (cam.Z < 40) continue;
       const X = cam.X, Y = cam.Y, S = cam.S;
-      ctx.globalAlpha = cam.fade(cam.Z);
+      ctx.globalAlpha = cam.fade(cam.Z) * fa;
       if (o instanceof Soldier) { const leader = o === sq.soldiers[0]; this.local(S * o.scale * (leader && o.tier === 0 ? 1.2 : 1), X, Y); sq.drawSoldier(ctx, o, leader, this); }
       else if (o instanceof Enemy) { const sdir = Math.atan2(qY - (Y - o.r * S), qX - X); this.local(S, X, Y); o.draw(ctx, sdir); }
       else if (o instanceof Barrel) { this.local(S, X, Y); o.draw(ctx, this.time); }
@@ -1727,16 +1973,18 @@ class Game {
   drawBullets(ctx) {
     const cam = this.cam, BH = 13;   // bullets fly at gun height
     ctx.globalCompositeOperation = 'lighter'; ctx.lineCap = 'round';
-    // Batch straight bullets into as few stroke calls as possible (new batch when colour or width changes)
-    let color = null, wm = 0;
+    // Batch straight bullets into as few stroke calls as possible (new batch when colour, width or alpha changes).
+    // Pass 0 = soft glow in the rarity colour; pass 1 = core in the weapon colour. Higher rarity = thicker, longer, brighter.
     for (let pass = 0; pass < 2; pass++) {
-      const base = pass === 0 ? 5 : 2; ctx.globalAlpha = pass === 0 ? 0.3 : 1;
-      color = null; wm = 0; ctx.beginPath();
+      const base = pass === 0 ? 5 : 2;
+      let color = null, vw = 0, ga = -1; ctx.beginPath();
       for (const b of this.bullets) {
         if (b.explode || cam.camY - b.y < 40) continue;
-        if (b.color !== color || b.wm !== wm) {
+        const c = pass === 0 ? b.gc : b.color, a = pass === 0 ? b.ga : 1;
+        if (c !== color || b.vw !== vw || a !== ga) {
           if (color) ctx.stroke();
-          ctx.beginPath(); color = b.color; wm = b.wm; ctx.strokeStyle = color; ctx.lineWidth = base * wm;
+          ctx.beginPath(); color = c; vw = b.vw; ga = a;
+          ctx.strokeStyle = c; ctx.lineWidth = base * Math.min(vw, MAX_LINE_WIDTH); ctx.globalAlpha = a;
         }
         const sp = Math.hypot(b.vx, b.vy) || 1;
         this.pline(ctx, b.x, b.y, BH, b.x - b.vx / sp * b.len, b.y - b.vy / sp * b.len, BH);
@@ -1744,12 +1992,19 @@ class Game {
       if (color) ctx.stroke();
     }
     ctx.globalAlpha = 1;
+    // Rockets. Late-game volleys keep 1000+ in the air, and each glow is a big additive sprite, so:
+    // glow grows only gently with bullet width, is capped in screen size, only the first MAX_ROCKET_GLOWS get one,
+    // and all the cores go into a single fill.
+    let glows = 0;
+    ctx.fillStyle = '#ffd0a0'; ctx.beginPath();
     for (const b of this.bullets) {
       if (!b.explode) continue;
       cam.p(b.x, b.y, BH); if (cam.Z < 40) continue;
-      drawGlow(ctx, cam.X, cam.Y, '#ff4d5e', 16 * cam.S * b.wm);
-      ctx.fillStyle = '#ffd0a0'; circle(ctx, cam.X, cam.Y, 4 * cam.S * b.wm); ctx.fill();
+      const vis = 1 + (b.vw - 1) * 0.3;
+      if (glows++ < MAX_ROCKET_GLOWS) drawGlow(ctx, cam.X, cam.Y, b.rar ? b.gc : '#ff4d5e', Math.min(16 * cam.S * vis, 44));
+      const rr = Math.min(4 * cam.S * vis, 12); ctx.moveTo(cam.X + rr, cam.Y); ctx.arc(cam.X, cam.Y, rr, 0, TAU);
     }
+    ctx.fill();
     // Enemy projectiles
     for (const b of this.eBullets) {
       cam.p(b.x, b.y, 12); if (cam.Z < 40) continue;
@@ -1785,7 +2040,7 @@ class Game {
   }
   drawMinimap(ctx) {
     const mw = this.cw < 600 ? 80 : 110, mh = this.cw < 600 ? 110 : 150, x = this.cw - mw - 12, y = this.ch - mh - 12;
-    const top = -300, sx = mw / this.W, sy = mh / (this.H - top);
+    const top = SPAWN_FAR - 50, sx = mw / this.W, sy = mh / (this.H - top);
     ctx.fillStyle = 'rgba(8,14,30,0.78)'; roundRect(ctx, x, y, mw, mh, 8); ctx.fill();
     ctx.strokeStyle = 'rgba(63,246,255,0.45)'; ctx.lineWidth = 1; ctx.stroke();
     ctx.strokeStyle = 'rgba(255,255,255,0.18)'; ctx.strokeRect(x + 1, y + (0 - top) * sy, mw - 2, this.H * sy - 1);
